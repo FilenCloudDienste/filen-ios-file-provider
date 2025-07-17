@@ -3,7 +3,7 @@
   <h3 align="center">Filen iOS File Provider Extension</h3>
 
   <p align="center">
-    Used in [filen-mobile](https://github.com/FilenCloudDienste/filen-mobile) as part of the mobile app
+    Used in <a href="https://github.com/FilenCloudDienste/filen-mobile">filen-mobile</a> as part of the mobile app
     <br/>
     <br/>
   </p>
