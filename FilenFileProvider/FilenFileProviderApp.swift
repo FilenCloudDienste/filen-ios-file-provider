@@ -40,7 +40,6 @@ struct TestView: View {
 				}
 			}
 			"""
-		print(content)
 		guard
 			let fileURL = FileManager.default.containerURL(
 				forSecurityApplicationGroupIdentifier: "group.io.filen.app")?.appending(
