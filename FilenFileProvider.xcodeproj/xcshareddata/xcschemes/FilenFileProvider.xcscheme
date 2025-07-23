@@ -11,7 +11,7 @@
             ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
             <ActionContent
                title = "Run Script"
-               scriptText = "configFilePath=&quot;${SRCROOT}/secrets.xcconfig&quot;&#10;&gt; $configFilePath&#10;cat &quot;${SRCROOT}/.env&quot; &gt;&gt; $configFilePath&#10;">
+               scriptText = "# Thanks apple&#10;unset MACOSX_DEPLOYMENT_TARGET&#10;unset TVOS_DEPLOYMENT_TARGET&#10;unset WATCHOS_DEPLOYMENT_TARGET&#10;unset XROS_DEPLOYMENT_TARGET&#10;unset DRIVERKIT_DEPLOYMENT_TARGET&#10;unset SDKROOT&#10;unset CMAKE_OSX_SYSROOT&#10;unset CMAKE_OSX_DEPLOYMENT_TARGET&#10;&#10;source ~/.bash_profile&#10;cd &quot;${PROJECT_DIR}&quot;&#10;echo &quot;PROJECT DIR: ${PROJECT_DIR}&quot;&#10;/bin/sh build-rust.sh --rust-dir ../filen-rs --rust-crate-name filen-mobile-native-cache&#10;&#10;configFilePath=secrets.xcconfig&#10;&gt; $configFilePath&#10;cat .env &gt;&gt; $configFilePath&#10;">
                <EnvironmentBuildable>
                   <BuildableReference
                      BuildableIdentifier = "primary"
