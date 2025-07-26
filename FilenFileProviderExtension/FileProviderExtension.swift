@@ -236,8 +236,13 @@ class FileProviderExtension: NSFileProviderExtension {
 		newName: String?
 	) async throws -> NSFileProviderItem {
 		do {
+			let newParent =
+				if parentItemIdentifier == .rootContainer { try self.getRootUuid() } else {
+					parentItemIdentifier.rawValue
+				}
 			let resp = try await self.state.moveItem(
-				item: itemIdentifier.rawValue, newParent: parentItemIdentifier.rawValue)
+				item: itemIdentifier.rawValue, newParent: newParent)
+
 			let item = FileProviderItem(
 				itemIdentifier: NSFileProviderItemIdentifier(resp.id), object: resp.object)
 			if let newName = newName {
