@@ -7,9 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		6F42419E2E09567900F3F4BD /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6F42419D2E09567900F3F4BD /* UniformTypeIdentifiers.framework */; };
 		6F4241AA2E09567900F3F4BD /* FilenFileProviderExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 6F42419B2E09567900F3F4BD /* FilenFileProviderExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A923876A2E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */; };
+		A94A39872E33C2D000CE63E7 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */; };
 		A9D3CAD32E292500009868D0 /* secrets.xcconfig in Resources */ = {isa = PBXBuildFile; fileRef = A9D3CAD22E292500009868D0 /* secrets.xcconfig */; };
 /* End PBXBuildFile section */
 
@@ -42,6 +42,7 @@
 		6F42419B2E09567900F3F4BD /* FilenFileProviderExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FilenFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		6F42419D2E09567900F3F4BD /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
 		A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libfilen_mobile_native_cache.xcframework; path = Frameworks/libfilen_mobile_native_cache.xcframework; sourceTree = "<group>"; };
+		A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
 		A9D3CAD22E292500009868D0 /* secrets.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = secrets.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -99,7 +100,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A923876A2E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework in Frameworks */,
-				6F42419E2E09567900F3F4BD /* UniformTypeIdentifiers.framework in Frameworks */,
+				A94A39872E33C2D000CE63E7 /* SystemConfiguration.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -130,6 +131,7 @@
 		6F42419C2E09567900F3F4BD /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */,
 				A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */,
 				6F42419D2E09567900F3F4BD /* UniformTypeIdentifiers.framework */,
 			);
@@ -167,7 +169,6 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 6F4241AC2E09567900F3F4BD /* Build configuration list for PBXNativeTarget "FilenFileProviderExtension" */;
 			buildPhases = (
-				A941DB112E26629600AA4E16 /* Run Script */,
 				6F4241972E09567900F3F4BD /* Sources */,
 				6F4241982E09567900F3F4BD /* Frameworks */,
 				6F4241992E09567900F3F4BD /* Resources */,
@@ -241,28 +242,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
-
-/* Begin PBXShellScriptBuildPhase section */
-		A941DB112E26629600AA4E16 /* Run Script */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Run Script";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/bash;
-			shellScript = "# Type a script or drag a script file from your workspace to insert its path.\nsource ~/.bash_profile\n/bin/sh ./build-rust.sh --rust-dir ../filen-rs --rust-crate-name filen-mobile-native-cache\n";
-		};
-/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		6F4241692E0955F600F3F4BD /* Sources */ = {

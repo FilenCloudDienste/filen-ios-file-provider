@@ -7,6 +7,24 @@
       parallelizeBuildables = "YES"
       buildImplicitDependencies = "YES"
       buildArchitectures = "Automatic">
+      <PreActions>
+         <ExecutionAction
+            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+            <ActionContent
+               title = "Run Script"
+               scriptText = "# Type a script or drag a script file from your workspace to insert its path.&#10;export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)&#10;export CC=$(xcrun --find clang)&#10;export CXX=$(xcrun --find clang++)&#10;&#10;source ~/.bash_profile&#10;cd $SRCROOT&#10;/bin/sh ./build-rust.sh --rust-dir ../filen-rs --rust-crate-name filen-mobile-native-cache&#10;">
+               <EnvironmentBuildable>
+                  <BuildableReference
+                     BuildableIdentifier = "primary"
+                     BlueprintIdentifier = "6F42419A2E09567900F3F4BD"
+                     BuildableName = "FilenFileProviderExtension.appex"
+                     BlueprintName = "FilenFileProviderExtension"
+                     ReferencedContainer = "container:FilenFileProvider.xcodeproj">
+                  </BuildableReference>
+               </EnvironmentBuildable>
+            </ActionContent>
+         </ExecutionAction>
+      </PreActions>
       <BuildActionEntries>
          <BuildActionEntry
             buildForTesting = "YES"
@@ -60,7 +78,7 @@
       <RemoteRunnable
          runnableDebuggingMode = "1"
          BundleIdentifier = "com.apple.DocumentsApp"
-         RemotePath = "/Library/Developer/CoreSimulator/Volumes/iOS_21F79/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 17.5.simruntime/Contents/Resources/RuntimeRoot/Applications/Files.app">
+         RemotePath = "/Library/Developer/CoreSimulator/Volumes/iOS_22F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 18.5.simruntime/Contents/Resources/RuntimeRoot/Applications/Files.app">
       </RemoteRunnable>
       <MacroExpansion>
          <BuildableReference
