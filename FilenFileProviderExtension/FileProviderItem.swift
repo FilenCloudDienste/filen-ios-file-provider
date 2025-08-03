@@ -7,8 +7,8 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 
 	var filename: String {
 		switch self.object {
-		case .file(let ffiFile): return ffiFile.name
-		case .dir(let ffiDir): return ffiDir.name
+		case .file(let ffiFile): return ffiFile.meta?.name ?? "CANNOT_DECRYPT_NAME_\(ffiFile.uuid)"
+		case .dir(let ffiDir): return ffiDir.meta?.name ?? "CANNOT_DECRYPT_NAME_\(ffiDir.uuid)"
 		case .root(_): return "Filen"
 		}
 	}
@@ -18,10 +18,10 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		switch object {
 		case let .file(ffiFile):
 			self.object = FfiObject.file(ffiFile)
-			suffix = "/" + ffiFile.name
+			suffix = "/" + (ffiFile.meta?.name ?? ffiFile.uuid)
 		case let .dir(ffiDir):
 			self.object = FfiObject.dir(ffiDir)
-			suffix = "/" + ffiDir.name
+			suffix = "/" + (ffiDir.meta?.name ?? ffiDir.uuid)
 		}
 
 		self.identifier = NSFileProviderItemIdentifier(parentItemIdentifier.rawValue + suffix)
@@ -74,7 +74,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 
 	var versionIdentifier: Data? {
 		switch self.object {
-		case .file(let ffiFile): return ffiFile.hash
+		case .file(let ffiFile): return ffiFile.meta?.hash
 		case .dir(_): return nil
 		case .root(_): return nil
 		}
@@ -83,7 +83,10 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var contentType: UTType {
 		switch self.object {
 		case .file(let file):
-			let name = file.name
+			guard let meta = file.meta else {
+				return .data  // default to data if no metadata
+			}
+			let name = meta.name
 			let lastDot = name.lastIndex(of: ".")
 			guard let lastDot = lastDot else {
 				return .data  // default to data if no extension
@@ -103,7 +106,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var contentModificationDate: Date? {
 		switch self.object {
 		case .file(let ffiFile):
-			return Date(timeIntervalSince1970: TimeInterval(ffiFile.modified / 1000))
+			return Date(timeIntervalSince1970: TimeInterval(ffiFile.meta?.modified ?? 0 / 1000))
 		case .dir(_): return nil
 		case .root(_): return nil
 		}
@@ -112,9 +115,9 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var creationDate: Date? {
 		switch self.object {
 		case .file(let ffiFile):
-			return Date(timeIntervalSince1970: TimeInterval(ffiFile.created / 1000))
+			return Date(timeIntervalSince1970: TimeInterval(ffiFile.meta?.created ?? 0 / 1000))
 		case .dir(let dir):
-			guard let created = dir.created else { return nil }
+			guard let created = dir.meta?.created else { return nil }
 			return Date(timeIntervalSince1970: TimeInterval(created / 1000))
 		case .root(_): return nil
 		}
