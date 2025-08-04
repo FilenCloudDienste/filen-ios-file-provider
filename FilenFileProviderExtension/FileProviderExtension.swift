@@ -131,10 +131,16 @@ class FileProviderExtension: NSFileProviderExtension {
 
 	override func startProvidingItem(at url: URL) async throws {
 		do {
-			let _ = try await self.state.downloadFileIfChangedByUuid(
-				uuid: url.lastPathComponent,
-				progressCallback: ProgressNotifier(
-					set: Self.downloadingSet, uuid: url.lastPathComponent))
+			guard let obj = try self.state.queryItemByUuid(uuid: url.lastPathComponent) else {
+				throw NSFileProviderError(.noSuchItem)
+			}
+			if case .file(_) = obj {
+				let _ = try await self.state.downloadFileIfChangedByUuid(
+					uuid: url.lastPathComponent,
+					progressCallback: ProgressNotifier(
+						set: Self.downloadingSet, uuid: url.lastPathComponent))
+			}
+
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
