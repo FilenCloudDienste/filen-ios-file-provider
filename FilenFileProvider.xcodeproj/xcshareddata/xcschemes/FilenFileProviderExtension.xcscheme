@@ -12,7 +12,7 @@
             ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
             <ActionContent
                title = "Run Script"
-               scriptText = "# Type a script or drag a script file from your workspace to insert its path.&#10;export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)&#10;export CC=$(xcrun --find clang)&#10;export CXX=$(xcrun --find clang++)&#10;&#10;source ~/.bash_profile&#10;cd $SRCROOT&#10;/bin/sh ./build-rust.sh --rust-dir ../filen-rs --rust-crate-name filen-mobile-native-cache&#10;">
+               scriptText = "# Type a script or drag a script file from your workspace to insert its path.&#10;export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)&#10;export CC=$(xcrun --find clang)&#10;export CXX=$(xcrun --find clang++)&#10;unset XROS_DEPLOYMENT_TARGET&#10;unset MACOSX_DEPLOYMENT_TARGET&#10;unset TVOS_DEPLOYMENT_TARGET&#10;unset WATCHOS_DEPLOYMENT_TARGET&#10;unset DRIVERKIT_DEPLOYMENT_TARGET&#10;unset SWIFT_DEBUG_INFORMATION_FORMAT&#10;unset SWIFT_DEBUG_INFORMATION_VERSION&#10;&#10;&#10;source ~/.bash_profile&#10;cd $SRCROOT&#10;/bin/sh ./build-rust.sh --rust-dir ../filen-rs --rust-crate-name filen-mobile-native-cache&#10;">
                <EnvironmentBuildable>
                   <BuildableReference
                      BuildableIdentifier = "primary"

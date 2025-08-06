@@ -11,6 +11,7 @@
 		A923876A2E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */; };
 		A94A39872E33C2D000CE63E7 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */; };
 		A9D3CAD32E292500009868D0 /* secrets.xcconfig in Resources */ = {isa = PBXBuildFile; fileRef = A9D3CAD22E292500009868D0 /* secrets.xcconfig */; };
+		A9E1D6382E422B9900CE63E7 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A99E516A2E41FC5500CE63E7 /* libc++.tbd */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -43,6 +44,7 @@
 		6F42419D2E09567900F3F4BD /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
 		A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libfilen_mobile_native_cache.xcframework; path = Frameworks/libfilen_mobile_native_cache.xcframework; sourceTree = "<group>"; };
 		A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+		A99E516A2E41FC5500CE63E7 /* libc++.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libc++.tbd"; path = "usr/lib/libc++.tbd"; sourceTree = SDKROOT; };
 		A9D3CAD22E292500009868D0 /* secrets.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = secrets.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -99,6 +101,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A9E1D6382E422B9900CE63E7 /* libc++.tbd in Frameworks */,
 				A923876A2E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework in Frameworks */,
 				A94A39872E33C2D000CE63E7 /* SystemConfiguration.framework in Frameworks */,
 			);
@@ -131,6 +134,7 @@
 		6F42419C2E09567900F3F4BD /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				A99E516A2E41FC5500CE63E7 /* libc++.tbd */,
 				A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */,
 				A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */,
 				6F42419D2E09567900F3F4BD /* UniformTypeIdentifiers.framework */,
