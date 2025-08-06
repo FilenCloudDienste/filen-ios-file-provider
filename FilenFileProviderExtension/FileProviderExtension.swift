@@ -186,6 +186,7 @@ class FileProviderExtension: NSFileProviderExtension {
 			if !fileURL.startAccessingSecurityScopedResource() {
 				throw NSFileProviderError(.noSuchItem)
 			}
+			defer { fileURL.stopAccessingSecurityScopedResource() }
 			let parent =
 				if parentItemIdentifier == .rootContainer { try self.getRootUuid() } else {
 					parentItemIdentifier.rawValue
@@ -219,7 +220,6 @@ class FileProviderExtension: NSFileProviderExtension {
 					itemIdentifier: NSFileProviderItemIdentifier(resp.id),
 					object: FfiObject.file(resp.file))
 			}
-			fileURL.stopAccessingSecurityScopedResource()
 			return item
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
