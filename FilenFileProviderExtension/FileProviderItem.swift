@@ -106,7 +106,8 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var contentModificationDate: Date? {
 		switch self.object {
 		case .file(let ffiFile):
-			return Date(timeIntervalSince1970: TimeInterval(ffiFile.meta?.modified ?? 0 / 1000))
+			guard let modified = ffiFile.meta?.modified else { return nil }
+			return Date(timeIntervalSince1970: TimeInterval(modified / 1000))
 		case .dir(_): return nil
 		case .root(_): return nil
 		}
@@ -115,7 +116,8 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var creationDate: Date? {
 		switch self.object {
 		case .file(let ffiFile):
-			return Date(timeIntervalSince1970: TimeInterval(ffiFile.meta?.created ?? 0 / 1000))
+			guard let created = ffiFile.meta?.created else { return nil }
+			return Date(timeIntervalSince1970: TimeInterval(created / 1000))
 		case .dir(let dir):
 			guard let created = dir.meta?.created else { return nil }
 			return Date(timeIntervalSince1970: TimeInterval(created / 1000))
