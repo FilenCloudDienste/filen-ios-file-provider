@@ -31,7 +31,7 @@ class FileProviderExtension: NSFileProviderExtension {
 	}
 
 	override func persistentIdentifierForItem(at url: URL) -> NSFileProviderItemIdentifier? {
-		let uuid = url.lastPathComponent
+		let uuid = url.pathComponents[url.pathComponents.count - 2]
 		do {
 			guard let path = try self.state.queryPathForUuid(uuid: uuid) else {
 				print("no path for uuid", uuid)
@@ -62,15 +62,18 @@ class FileProviderExtension: NSFileProviderExtension {
 		case .file(let item):
 			return NSFileProviderManager.default.documentStorageURL.appending(
 				path: "cache", directoryHint: .isDirectory
-			).appending(path: item.uuid, directoryHint: .notDirectory)
+			).appending(path: item.uuid, directoryHint: .isDirectory).appending(
+				component: item.meta?.name ?? item.uuid, directoryHint: .notDirectory)
 		case .dir(let item):
 			return NSFileProviderManager.default.documentStorageURL.appending(
 				path: "cache", directoryHint: .isDirectory
-			).appending(path: item.uuid, directoryHint: .isDirectory)
+			).appending(path: item.uuid, directoryHint: .isDirectory).appending(
+				component: item.meta?.name ?? item.uuid, directoryHint: .isDirectory)
 		case .root(let item):
 			return NSFileProviderManager.default.documentStorageURL.appending(
 				path: "cache", directoryHint: .isDirectory
-			).appending(path: item.uuid, directoryHint: .isDirectory)
+			).appending(path: item.uuid, directoryHint: .isDirectory).appending(
+				component: "root", directoryHint: .isDirectory)
 		}
 	}
 
@@ -96,7 +99,7 @@ class FileProviderExtension: NSFileProviderExtension {
 	// MARK: - Managing shared files
 
 	override func itemChanged(at url: URL) {
-		let uuid = url.lastPathComponent
+		let uuid = url.pathComponents[url.pathComponents.count - 2]
 		let path = try? self.state.queryPathForUuid(uuid: uuid)
 		guard let path = path else {
 			print("no item found for uuid", uuid)
@@ -131,14 +134,14 @@ class FileProviderExtension: NSFileProviderExtension {
 
 	override func startProvidingItem(at url: URL) async throws {
 		do {
-			guard let obj = try self.state.queryItemByUuid(uuid: url.lastPathComponent) else {
+			let uuid = url.pathComponents[url.pathComponents.count - 2]
+			guard let obj = try self.state.queryItemByUuid(uuid: uuid) else {
 				throw NSFileProviderError(.noSuchItem)
 			}
 			if case .file(_) = obj {
 				let _ = try await self.state.downloadFileIfChangedByUuid(
-					uuid: url.lastPathComponent,
-					progressCallback: ProgressNotifier(
-						set: Self.downloadingSet, uuid: url.lastPathComponent))
+					uuid: uuid,
+					progressCallback: ProgressNotifier(set: Self.downloadingSet, uuid: uuid))
 			}
 
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
@@ -146,9 +149,10 @@ class FileProviderExtension: NSFileProviderExtension {
 
 	override func stopProvidingItem(at url: URL) {
 		Task {
-			do { try await self.state.clearLocalCacheByUuid(uuid: url.lastPathComponent) } catch let
-				error as CacheError
-			{ throw cacheErrorToError(error: error) }
+			do {
+				try await self.state.clearLocalCacheByUuid(
+					uuid: url.pathComponents[url.pathComponents.count - 2])
+			} catch let error as CacheError { throw cacheErrorToError(error: error) }
 		}
 	}
 
