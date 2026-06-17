@@ -7,6 +7,7 @@ let PROVIDER = "app.filen.io"
 let BACKGROUND_ID = PROVIDER + ".background"
 
 class FileProviderExtension: NSFileProviderExtension {
+	private static let logger = Logger(subsystem: PROVIDER, category: "FileProvider")
 	let state: FilenMobileCacheState
 	var rootUuid: String?
 	public static var uploadingSet = OSAllocatedUnfairLock(initialState: Set<String>())
@@ -34,13 +35,13 @@ class FileProviderExtension: NSFileProviderExtension {
 		let uuid = url.pathComponents[url.pathComponents.count - 2]
 		do {
 			guard let path = try self.state.queryPathForUuid(uuid: uuid) else {
-				print("no path for uuid", uuid)
+				Self.logger.error("no path for uuid \(uuid)")
 				return nil
 			}
 			let id = NSFileProviderItemIdentifier(rawValue: path)
 			return id
 		} catch {
-			print("error getting path for uuid", uuid, error)
+			Self.logger.error("error getting path for uuid \(uuid): \(error)")
 			return nil
 		}
 	}
@@ -51,11 +52,11 @@ class FileProviderExtension: NSFileProviderExtension {
 		let object: FfiObject?
 
 		do { object = try self.objectForId(identifier: identifier) } catch {
-			print("error getting url for : ", error, identifier.rawValue)
+			Self.logger.error("error getting url for \(identifier.rawValue): \(error)")
 			return nil
 		}
 		guard let object = object else {
-			print("no url for item :", identifier.rawValue)
+			Self.logger.error("no url for item \(identifier.rawValue)")
 			return nil
 		}
 		switch object {
@@ -102,7 +103,7 @@ class FileProviderExtension: NSFileProviderExtension {
 		let uuid = url.pathComponents[url.pathComponents.count - 2]
 		let path = try? self.state.queryPathForUuid(uuid: uuid)
 		guard let path = path else {
-			print("no item found for uuid", uuid)
+			Self.logger.error("no item found for uuid \(uuid)")
 			return
 		}
 		Task {
@@ -110,7 +111,11 @@ class FileProviderExtension: NSFileProviderExtension {
 				let _ = try await self.state.uploadFileIfChanged(
 					path: path,
 					progressCallback: ProgressNotifier(set: Self.uploadingSet, uuid: uuid))
-			} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
+			} catch {
+				Self.logger.error("itemChanged failed for uuid \(uuid): \(error)")
+				// re-signal so the change is retried rather than lost
+				NSFileProviderManager.default.signalEnumerator(for: .workingSet) { _ in }
+			}
 		}
 	}
 
@@ -148,11 +153,13 @@ class FileProviderExtension: NSFileProviderExtension {
 	}
 
 	override func stopProvidingItem(at url: URL) {
+		let uuid = url.pathComponents[url.pathComponents.count - 2]
 		Task {
 			do {
-				try await self.state.clearLocalCacheByUuid(
-					uuid: url.pathComponents[url.pathComponents.count - 2])
-			} catch let error as CacheError { throw cacheErrorToError(error: error) }
+				try await self.state.clearLocalCacheByUuid(uuid: uuid)
+			} catch {
+				Self.logger.error("stopProvidingItem failed for uuid \(uuid): \(error)")
+			}
 		}
 	}
 
@@ -199,12 +206,15 @@ class FileProviderExtension: NSFileProviderExtension {
 				.nameKey, .isDirectoryKey, .creationDateKey, .contentModificationDateKey,
 				.typeIdentifierKey,
 			])
-			let name = resourceValues.name!
+			guard let name = resourceValues.name else {
+				throw NSFileProviderError(.noSuchItem)
+			}
 			let creationInterval = resourceValues.creationDate?.timeIntervalSince1970
 			let creationTimeStamp = creationInterval.map { Int64($0 * 1000) }
 
+			let isDirectory = resourceValues.isDirectory ?? false
 			let item: FileProviderItem
-			if resourceValues.isDirectory! {
+			if isDirectory {
 				let info = try await self.state.createDir(
 					parentPath: parent, name: name, created: creationTimeStamp)
 				item = FileProviderItem(
@@ -315,8 +325,13 @@ class FileProviderExtension: NSFileProviderExtension {
 					String(
 						itemIdentifier.rawValue[itemIdentifier.rawValue.index(after: lastSlash)...])
 				} else { throw NSFileProviderError(.noSuchItem) }
+			let target: String? =
+				if let parentItemIdentifier = parentItemIdentifier {
+					parentItemIdentifier == .rootContainer
+						? try self.getRootUuid() : parentItemIdentifier.rawValue
+				} else { nil }
 			let resp = try await self.state.restoreItem(
-				uuid: uuid, to: parentItemIdentifier?.rawValue)
+				uuid: uuid, to: target)
 			return FileProviderItem(
 				itemIdentifier: NSFileProviderItemIdentifier(resp.id), object: resp.object)
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
@@ -336,10 +351,7 @@ class FileProviderExtension: NSFileProviderExtension {
 			NSFileProviderItemIdentifier, Data?, Error?
 		) -> Void, completionHandler: @Sendable @escaping (Error?) -> Void
 	) -> Progress {
-		print("fetchThumbnails for \(itemIdentifiers.count) items")
-		for itemIdentifier in itemIdentifiers {
-			print("fetching thumbnail for item: \(itemIdentifier.rawValue)")
-		}
+		Self.logger.debug("fetchThumbnails for \(itemIdentifiers.count) items")
 		let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
 		let fetchHandler = FetchThumbnailHandler(
 			perThumbnailCompletionHandler: perThumbnailCompletionHandler,
@@ -350,10 +362,13 @@ class FileProviderExtension: NSFileProviderExtension {
 				requestedHeight: UInt32(size.height), callback: fetchHandler)
 			progress.cancellationHandler = { thumbnailTask.cancel() }
 		} catch let error {
-			// this will succeed because getThumbnails will throw a CacheError
-			// unfortunately uniffi doesn't support swift 6 yet
-			let cacheError = error as! CacheError
-			completionHandler(cacheErrorToError(error: cacheError))
+			// getThumbnails should throw a CacheError, but guard against any
+			// other error type so we never force-crash the extension
+			if let cacheError = error as? CacheError {
+				completionHandler(cacheErrorToError(error: cacheError))
+			} else {
+				completionHandler(error)
+			}
 		}
 		return progress
 	}

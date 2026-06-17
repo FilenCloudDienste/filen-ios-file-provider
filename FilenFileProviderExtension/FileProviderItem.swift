@@ -1,3 +1,4 @@
+import CryptoKit
 import FileProvider
 import UniformTypeIdentifiers
 
@@ -41,7 +42,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var capabilities: NSFileProviderItemCapabilities {
 		switch self.object {
 		case .file(_):
-			if self.identifier.rawValue.starts(with: "trash/") {
+			if self.isTrashed {
 				// allowsTrashing also specifies that it can be restored
 				[.allowsTrashing, .allowsDeleting]
 			} else {
@@ -51,7 +52,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 				]
 			}
 		case .dir(_):
-			if self.identifier.rawValue.starts(with: "trash/") {
+			if self.isTrashed {
 				// allowsTrashing also specifies that it can be restored
 				[.allowsTrashing, .allowsDeleting]
 			} else {
@@ -73,11 +74,27 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	}
 
 	var versionIdentifier: Data? {
+		// build a stable, metadata-inclusive digest so renames / recolors /
+		// favorite changes produce a staleness signal for every item type
+		var components: [String]
 		switch self.object {
-		case .file(let ffiFile): return ffiFile.meta?.hash
-		case .dir(_): return nil
-		case .root(_): return nil
+		case .file(let ffiFile):
+			components = [
+				"file", ffiFile.uuid, ffiFile.parent, "\(ffiFile.size)",
+				"\(ffiFile.favoriteRank)", ffiFile.meta?.name ?? "", ffiFile.meta?.mime ?? "",
+				"\(ffiFile.meta?.modified ?? 0)",
+				ffiFile.meta?.hash?.base64EncodedString() ?? "",
+			]
+		case .dir(let ffiDir):
+			components = [
+				"dir", ffiDir.uuid, ffiDir.parent, "\(ffiDir.favoriteRank)",
+				ffiDir.meta?.name ?? "", ffiDir.color ?? "", "\(ffiDir.meta?.created ?? 0)",
+			]
+		case .root(let ffiRoot):
+			components = ["root", ffiRoot.uuid]
 		}
+		let digest = SHA256.hash(data: Data(components.joined(separator: "\u{0}").utf8))
+		return Data(digest)
 	}
 
 	var contentType: UTType {
@@ -85,6 +102,10 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		case .file(let file):
 			guard let meta = file.meta else {
 				return .data  // default to data if no metadata
+			}
+			// prefer the authoritative mime type from metadata
+			if let type = UTType(mimeType: meta.mime) {
+				return type
 			}
 			let name = meta.name
 			let lastDot = name.lastIndex(of: ".")
@@ -107,7 +128,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		switch self.object {
 		case .file(let ffiFile):
 			guard let modified = ffiFile.meta?.modified else { return nil }
-			return Date(timeIntervalSince1970: TimeInterval(modified / 1000))
+			return Date(timeIntervalSince1970: TimeInterval(modified) / 1000)
 		case .dir(_): return nil
 		case .root(_): return nil
 		}
@@ -117,10 +138,10 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		switch self.object {
 		case .file(let ffiFile):
 			guard let created = ffiFile.meta?.created else { return nil }
-			return Date(timeIntervalSince1970: TimeInterval(created / 1000))
+			return Date(timeIntervalSince1970: TimeInterval(created) / 1000)
 		case .dir(let dir):
 			guard let created = dir.meta?.created else { return nil }
-			return Date(timeIntervalSince1970: TimeInterval(created / 1000))
+			return Date(timeIntervalSince1970: TimeInterval(created) / 1000)
 		case .root(_): return nil
 		}
 	}

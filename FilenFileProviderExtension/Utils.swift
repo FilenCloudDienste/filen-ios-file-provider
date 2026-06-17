@@ -25,6 +25,8 @@ func cacheErrorToError(error: CacheError) -> any Error {
 		return NSFileProviderError(.notAuthenticated)
 	case CacheError.DoesNotExist(_), CacheError.NotADirectory(_):
 		return NSFileProviderError(.noSuchItem)
+	case CacheError.InvalidName(_):
+		return NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError)
 	default: return error
 	}
 }
