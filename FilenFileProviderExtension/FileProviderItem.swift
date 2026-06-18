@@ -129,7 +129,9 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		case .file(let ffiFile):
 			guard let modified = ffiFile.meta?.modified else { return nil }
 			return Date(timeIntervalSince1970: TimeInterval(modified) / 1000)
-		case .dir(_): return nil
+		case .dir(let dir):
+			guard let created = dir.meta?.created else { return nil }
+			return Date(timeIntervalSince1970: TimeInterval(created) / 1000)
 		case .root(_): return nil
 		}
 	}
