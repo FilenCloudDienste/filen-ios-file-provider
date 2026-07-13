@@ -9,7 +9,9 @@ let BACKGROUND_ID = PROVIDER + ".background"
 
 // auth.json DEK keychain item — these MUST match the app side (fileProvider.ts via expo-secure-store).
 // The team-prefixed access group is what lets the app and this extension share the item; the app group
-// alone does not grant keychain sharing on iOS.
+// alone does not grant keychain sharing on iOS. NOTE: expo-secure-store appends ":no-auth" to the
+// service for items stored without requireAuthentication, so the keychain queries below use
+// "\(AUTH_DEK_SERVICE):no-auth" to match the item the app actually wrote.
 let AUTH_DEK_ACCESS_GROUP = "7YTW5D2K7P.io.filen.sharedkeys"
 let AUTH_DEK_SERVICE = "io.filen.fileprovider"
 let AUTH_DEK_ACCOUNT = "fileProviderAuthKey"
@@ -42,7 +44,7 @@ class FileProviderExtension: NSFileProviderExtension {
 	private static func readAuthDek() -> Data? {
 		let query: [String: Any] = [
 			kSecClass as String: kSecClassGenericPassword,
-			kSecAttrService as String: AUTH_DEK_SERVICE,
+			kSecAttrService as String: "\(AUTH_DEK_SERVICE):no-auth",
 			kSecAttrAccount as String: Data(AUTH_DEK_ACCOUNT.utf8),
 			kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
 			kSecReturnData as String: true,
@@ -88,7 +90,7 @@ class FileProviderExtension: NSFileProviderExtension {
 		let accountData = Data(AUTH_DEK_ACCOUNT.utf8)
 		let addQuery: [String: Any] = [
 			kSecClass as String: kSecClassGenericPassword,
-			kSecAttrService as String: AUTH_DEK_SERVICE,
+			kSecAttrService as String: "\(AUTH_DEK_SERVICE):no-auth",
 			kSecAttrGeneric as String: accountData,
 			kSecAttrAccount as String: accountData,
 			kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
