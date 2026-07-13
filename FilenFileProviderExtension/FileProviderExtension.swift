@@ -1,10 +1,18 @@
 import FileProvider
 import Foundation
+import Security
 import UniformTypeIdentifiers
 import os
 
 let PROVIDER = "app.filen.io"
 let BACKGROUND_ID = PROVIDER + ".background"
+
+// auth.json DEK keychain item — these MUST match the app side (fileProvider.ts via expo-secure-store).
+// The team-prefixed access group is what lets the app and this extension share the item; the app group
+// alone does not grant keychain sharing on iOS.
+let AUTH_DEK_ACCESS_GROUP = "7YTW5D2K7P.io.filen.sharedkeys"
+let AUTH_DEK_SERVICE = "io.filen.fileprovider"
+let AUTH_DEK_ACCOUNT = "fileProviderAuthKey"
 
 class FileProviderExtension: NSFileProviderExtension {
 	private static let logger = Logger(subsystem: PROVIDER, category: "FileProvider")
@@ -22,13 +30,45 @@ class FileProviderExtension: NSFileProviderExtension {
 		return uuid
 	}
 
+	// Reads the 32-byte auth.json DEK from the shared Keychain access group. The app stores it
+	// base64-encoded via expo-secure-store; decode it back to raw bytes for the Rust cache. On any
+	// failure (not provisioned yet, or the item is unavailable before first unlock) return empty
+	// Data, which makes the Rust decrypt fail -> AuthFile::default() -> unauthenticated (fail-closed).
+	// Never crash init(): self.state is non-optional.
+	private static func loadAuthDek() -> Data {
+		let query: [String: Any] = [
+			kSecClass as String: kSecClassGenericPassword,
+			kSecAttrService as String: AUTH_DEK_SERVICE,
+			kSecAttrAccount as String: AUTH_DEK_ACCOUNT,
+			kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
+			kSecReturnData as String: true,
+			kSecMatchLimit as String: kSecMatchLimitOne,
+		]
+		var item: CFTypeRef?
+		let status = SecItemCopyMatching(query as CFDictionary, &item)
+		guard status == errSecSuccess,
+			let stored = item as? Data,
+			let base64 = String(data: stored, encoding: .utf8),
+			let dek = Data(base64Encoded: base64)
+		else {
+			Self.logger.error(
+				"auth DEK unavailable from keychain (status \(status)); provider stays unauthenticated until the app provisions it"
+			)
+			return Data()
+		}
+		return dek
+	}
+
 	override init() {
-		self.state = FilenMobileCacheState.init(
-			filesDir: NSFileProviderManager.default.documentStorageURL.path(percentEncoded: false),
-			authFile: FileManager.default.containerURL(
+		let authFile =
+			FileManager.default.containerURL(
 				forSecurityApplicationGroupIdentifier: "group.io.filen.app")?.appending(
 					component: "auth.json"
-				).path(percentEncoded: false) ?? "", )
+				).path(percentEncoded: false) ?? ""
+		self.state = FilenMobileCacheState.init(
+			filesDir: NSFileProviderManager.default.documentStorageURL.path(percentEncoded: false),
+			authFile: authFile,
+			dek: Self.loadAuthDek())
 	}
 
 	override func persistentIdentifierForItem(at url: URL) -> NSFileProviderItemIdentifier? {
