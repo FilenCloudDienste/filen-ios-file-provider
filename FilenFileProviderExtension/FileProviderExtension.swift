@@ -36,10 +36,13 @@ class FileProviderExtension: NSFileProviderExtension {
 	// Data, which makes the Rust decrypt fail -> AuthFile::default() -> unauthenticated (fail-closed).
 	// Never crash init(): self.state is non-optional.
 	private static func loadAuthDek() -> Data {
+		// expo-secure-store stores the account as the UTF-8 Data of the key (Data(key.utf8)), NOT a
+		// String — the keychain matches attributes by exact type, so we must query with the same Data
+		// or SecItemCopyMatching won't find the item the app wrote.
 		let query: [String: Any] = [
 			kSecClass as String: kSecClassGenericPassword,
 			kSecAttrService as String: AUTH_DEK_SERVICE,
-			kSecAttrAccount as String: AUTH_DEK_ACCOUNT,
+			kSecAttrAccount as String: Data(AUTH_DEK_ACCOUNT.utf8),
 			kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
 			kSecReturnData as String: true,
 			kSecMatchLimit as String: kSecMatchLimitOne,
