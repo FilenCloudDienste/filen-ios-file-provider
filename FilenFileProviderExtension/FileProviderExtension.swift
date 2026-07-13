@@ -35,10 +35,11 @@ class FileProviderExtension: NSFileProviderExtension {
 	// failure (not provisioned yet, or the item is unavailable before first unlock) return empty
 	// Data, which makes the Rust decrypt fail -> AuthFile::default() -> unauthenticated (fail-closed).
 	// Never crash init(): self.state is non-optional.
-	private static func loadAuthDek() -> Data {
-		// expo-secure-store stores the account as the UTF-8 Data of the key (Data(key.utf8)), NOT a
-		// String — the keychain matches attributes by exact type, so we must query with the same Data
-		// or SecItemCopyMatching won't find the item the app wrote.
+	// Reads the auth.json DEK from the shared keychain, or nil if absent. expo-secure-store stores the
+	// account as the UTF-8 Data of the key (Data(key.utf8)), NOT a String — the keychain matches
+	// attributes by exact type, so we query with the same Data or SecItemCopyMatching won't find the
+	// item the app wrote.
+	private static func readAuthDek() -> Data? {
 		let query: [String: Any] = [
 			kSecClass as String: kSecClassGenericPassword,
 			kSecAttrService as String: AUTH_DEK_SERVICE,
@@ -54,12 +55,59 @@ class FileProviderExtension: NSFileProviderExtension {
 			let base64 = String(data: stored, encoding: .utf8),
 			let dek = Data(base64Encoded: base64)
 		else {
-			Self.logger.error(
-				"auth DEK unavailable from keychain (status \(status)); provider stays unauthenticated until the app provisions it"
-			)
-			return Data()
+			if status != errSecItemNotFound {
+				Self.logger.error("auth DEK read failed (status \(status))")
+			}
+			return nil
 		}
 		return dek
+	}
+
+	// Load-or-provision the DEK. The extension isn't domain-gated, so the system can construct it
+	// BEFORE the app enables the provider and provisions the key; since the Rust cache captures the
+	// key at construction but re-reads auth.json on a poll, an absent-then-appearing key would strand
+	// the provider unauthenticated until its process restarts. Provisioning here (idempotent — the app
+	// reuses the same item) guarantees a valid, stable key up front. The item is written in
+	// expo-secure-store's exact format so the app reads the identical key. Any failure returns empty
+	// Data -> Rust decrypt fails -> unauthenticated (fail-closed). Never crashes init().
+	private static func loadAuthDek() -> Data {
+		if let existing = readAuthDek() {
+			return existing
+		}
+
+		var dek = Data(count: 32)
+		let generated = dek.withUnsafeMutableBytes { pointer in
+			SecRandomCopyBytes(kSecRandomDefault, 32, pointer.baseAddress!)
+		}
+
+		guard generated == errSecSuccess else {
+			Self.logger.error("auth DEK generation failed")
+			return Data()
+		}
+
+		let accountData = Data(AUTH_DEK_ACCOUNT.utf8)
+		let addQuery: [String: Any] = [
+			kSecClass as String: kSecClassGenericPassword,
+			kSecAttrService as String: AUTH_DEK_SERVICE,
+			kSecAttrGeneric as String: accountData,
+			kSecAttrAccount as String: accountData,
+			kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
+			kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+			kSecValueData as String: Data(dek.base64EncodedString().utf8),
+		]
+		let status = SecItemAdd(addQuery as CFDictionary, nil)
+
+		if status == errSecSuccess {
+			return dek
+		}
+
+		// The app provisioned it concurrently — read the winner so both sides share one key.
+		if status == errSecDuplicateItem {
+			return Self.readAuthDek() ?? Data()
+		}
+
+		Self.logger.error("auth DEK provision failed (status \(status))")
+		return Data()
 	}
 
 	override init() {
