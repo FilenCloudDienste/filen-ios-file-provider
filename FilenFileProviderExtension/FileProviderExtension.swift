@@ -118,8 +118,25 @@ class FileProviderExtension: NSFileProviderExtension {
 				forSecurityApplicationGroupIdentifier: "group.io.filen.app")?.appending(
 					component: "auth.json"
 				).path(percentEncoded: false) ?? ""
-		self.state = FilenMobileCacheState.init(
+		// The SQLite files (native_cache.db, db_state.json, SDK search DB) live in the
+		// EXTENSION'S private container, not in documentStorage: documentStorage sits inside
+		// the shared app-group container, and iOS kills a process that is suspended while
+		// holding a file/SQLite lock there (RUNNINGBOARD 0xdead10cc) — both DBs are WAL, which
+		// holds a lock even while idle. Content files stay under documentStorage. DB files an
+		// earlier build left there are deliberately abandoned (nothing opens those paths again);
+		// the fresh location reinitializes and re-syncs the cache once. Failure to create the
+		// dir here is non-fatal by design — the Rust side create_dir_all's it again.
+		var dbDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+			.appending(component: "database")
+		try? FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+		// Re-syncable cache, wiped on logout — keep it out of iCloud/local backups (a restored
+		// stale DB would just fail auth decryption and be wiped anyway).
+		var backupValues = URLResourceValues()
+		backupValues.isExcludedFromBackup = true
+		try? dbDir.setResourceValues(backupValues)
+		self.state = FilenMobileCacheState.newWithDbDir(
 			filesDir: NSFileProviderManager.default.documentStorageURL.path(percentEncoded: false),
+			dbDir: dbDir.path(percentEncoded: false),
 			authFile: authFile,
 			dek: Self.loadAuthDek())
 	}
