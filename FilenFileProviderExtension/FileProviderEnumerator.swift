@@ -49,6 +49,28 @@ class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 		}
 	}
 
+	// How many children to hand the system per enumeration page.
+	private static let pageSize: UInt32 = 250
+
+	// The system's initial pages (sortedByName/Date) map to offset 0 — a fresh enumeration that
+	// refreshes from the server; our own cursors carry a little-endian UInt32 offset into the
+	// (locally cached, name-sorted) child listing.
+	private static func pageOffset(_ page: NSFileProviderPage) -> UInt32 {
+		// The initial-page constants are plain `Data` sentinels, not encoded offsets.
+		let data = page.rawValue
+		if data == NSFileProviderPage.initialPageSortedByName as Data
+			|| data == NSFileProviderPage.initialPageSortedByDate as Data
+		{
+			return 0
+		}
+		guard data.count == 4 else { return 0 }
+		return data.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
+	}
+
+	private static func encodePageOffset(_ offset: UInt32) -> NSFileProviderPage {
+		NSFileProviderPage(rawValue: withUnsafeBytes(of: offset.littleEndian) { Data($0) })
+	}
+
 	func enumerateItems(
 		for observer: any NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage
 	) {
@@ -89,10 +111,15 @@ class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 				return
 			}
 
+			// Paginate: hand the system one page of children at a time via an offset cursor.
+			// Refresh from the server only on the first page (offset 0) — Filen's dir listing has
+			// no server-side cursor, so we re-list once and page the rest from cache.
+			let offset = Self.pageOffset(page)
 			let response: QueryChildrenResponse?
 			do {
-				response = try await self.state.updateAndQueryDirChildren(
-					path: self.enumeratedItemIdentifier.rawValue, orderBy: nil)
+				response = try await self.state.updateAndQueryDirChildrenPage(
+					path: self.enumeratedItemIdentifier.rawValue, orderBy: nil,
+					offset: offset, limit: Self.pageSize, refresh: offset == 0)
 			} catch let error as CacheError {
 				observer.finishEnumeratingWithError(cacheErrorToError(error: error))
 				return
@@ -108,7 +135,12 @@ class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 			}
 
 			observer.didEnumerate(items)
-			observer.finishEnumerating(upTo: nil)
+			// A full page means more may follow — advance the cursor; a short page ends it.
+			if response.objects.count == Int(Self.pageSize) {
+				observer.finishEnumerating(upTo: Self.encodePageOffset(offset + Self.pageSize))
+			} else {
+				observer.finishEnumerating(upTo: nil)
+			}
 		}
 	}
 }
