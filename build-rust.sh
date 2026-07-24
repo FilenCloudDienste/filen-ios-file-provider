@@ -50,3 +50,6 @@ xcodebuild -create-xcframework \
 
 cp -r target/ios/lib${libname}.xcframework "$xcode_dir/Frameworks"
 cp target/uniffi-xcframework-staging/${libname}.swift "$xcode_dir/FilenFileProviderExtension/filen_mobile_native_cache.swift"
+# The test bundle is its own module and links the same xcframework, so it needs its own copy of the
+# bindings. Both are generated, gitignored, and regenerated together to stay in sync.
+cp target/uniffi-xcframework-staging/${libname}.swift "$xcode_dir/FilenFileProviderTests/filen_mobile_native_cache.swift"

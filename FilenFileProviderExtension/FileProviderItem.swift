@@ -5,6 +5,10 @@ import UniformTypeIdentifiers
 class FileProviderItem: NSObject, NSFileProviderItem {
 	private let identifier: NSFileProviderItemIdentifier
 	private let object: FfiObject
+	// The container identifier this item was constructed under. File
+	// identifiers are stable ids (no path structure), so their parent cannot
+	// be derived by string-splitting — it must be carried explicitly.
+	private let explicitParentIdentifier: NSFileProviderItemIdentifier?
 
 	var filename: String {
 		switch self.object {
@@ -14,29 +18,56 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		}
 	}
 
+	/// `parentItemIdentifier` is what the system should see as the parent
+	/// (`.rootContainer` for root children — the enumerator substitutes the
+	/// root uuid only for its own cache queries).
 	init(parentItemIdentifier: NSFileProviderItemIdentifier, object: FfiNonRootObject) {
-		var suffix: String
+		// Items are identified by their whole-life id, per the platform
+		// contract ("A document's identifier ... should not change when the
+		// document is edited, moved, or renamed"): for files the server-minted
+		// stable id (the plain uuid is re-minted on every content edit and
+		// version restore), for directories the uuid itself (stable == uuid on
+		// the wire, by design). The Rust cache resolves the `stable/`
+		// namespace for every operation.
 		switch object {
 		case let .file(ffiFile):
 			self.object = FfiObject.file(ffiFile)
-			suffix = "/" + (ffiFile.meta?.name ?? ffiFile.uuid)
+			self.identifier = NSFileProviderItemIdentifier("stable/" + ffiFile.stableUuid)
 		case let .dir(ffiDir):
 			self.object = FfiObject.dir(ffiDir)
-			suffix = "/" + (ffiDir.meta?.name ?? ffiDir.uuid)
+			self.identifier = NSFileProviderItemIdentifier("stable/" + ffiDir.uuid)
 		}
-
-		self.identifier = NSFileProviderItemIdentifier(parentItemIdentifier.rawValue + suffix)
+		self.explicitParentIdentifier = parentItemIdentifier
 	}
 
-	init(itemIdentifier: NSFileProviderItemIdentifier, object: FfiObject) {
+	init(
+		itemIdentifier: NSFileProviderItemIdentifier, object: FfiObject,
+		parentItemIdentifier: NSFileProviderItemIdentifier? = nil
+	) {
 		self.identifier = itemIdentifier
 		self.object = object
+		self.explicitParentIdentifier = parentItemIdentifier
 	}
 
 	var itemIdentifier: NSFileProviderItemIdentifier { return identifier }
 
 	var parentItemIdentifier: NSFileProviderItemIdentifier {
-		getParentItemIdentifier(itemIdentifier: self.identifier)
+		if let explicitParentIdentifier { return explicitParentIdentifier }
+
+		// No explicit parent: derive it from the object, which carries its own container (its
+		// ORIGINAL parent while trashed). Deriving it by string-splitting the identifier cannot
+		// work — every identifier this app issues is `stable/<uuid>`, a single slash, which
+		// `getParentItemIdentifier` collapses to `.rootContainer`; that would silently reparent
+		// the item to the drive root.
+		//
+		// Callers that know the root uuid should still pass the parent explicitly, so that a root
+		// child gets the `.rootContainer` sentinel rather than the root's own `stable/` form.
+		if let containerUuid = objectToContainerUuid(object: self.object) {
+			return NSFileProviderItemIdentifier("stable/" + containerUuid)
+		}
+
+		// Pre-migration path-form identifiers still split correctly.
+		return getParentItemIdentifier(itemIdentifier: self.identifier)
 	}
 
 	var capabilities: NSFileProviderItemCapabilities {
@@ -123,7 +154,18 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		}
 	}
 
-	var isTrashed: Bool { self.identifier.rawValue.starts(with: "trash/") }
+	var isTrashed: Bool {
+		// File identifiers are stable ids with no `trash/` prefix, so trash
+		// state comes from the object itself (a trashed item's parent renders
+		// as the "trash" sentinel). The prefix check stays for identifiers
+		// handed back by trash responses.
+		if self.identifier.rawValue.starts(with: "trash/") { return true }
+		switch self.object {
+		case .file(let ffiFile): return ffiFile.parent == "trash"
+		case .dir(let ffiDir): return ffiDir.parent == "trash"
+		case .root(_): return false
+		}
+	}
 	var contentModificationDate: Date? {
 		switch self.object {
 		case .file(let ffiFile):

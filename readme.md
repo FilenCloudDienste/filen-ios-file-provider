@@ -18,6 +18,27 @@
 2) Copy .env.example to .env and fill it out with relevant account details for a test account
 3) Run either target depending on what you want to debug
 
+## Testing
+
+`FilenFileProviderTests` is a host-less unit test bundle covering the cache FFI the extension
+depends on for item identity — the `stable/<id>` namespace across renames and moves, plus
+`queryPathForUuid` and `queryItemByUuid`. It runs against the live backend, so it needs the same
+test account as above.
+
+```sh
+./run-tests.sh                                   # uses ./.env
+FILEN_TEST_ENV=/path/to/.env ./run-tests.sh      # or point elsewhere
+FILEN_TEST_DESTINATION='platform=iOS Simulator,name=iPhone 16' ./run-tests.sh
+```
+
+In CI there is usually no `.env` — export `EMAIL`, `MASTER_KEYS`, `API_KEY`, `PRIVATE_KEY`,
+`AUTH_VERSION` and `BASE_FOLDER_UUID` from your secret store instead and the script picks them up
+directly. Both the shell (`KEY=value`) and xcconfig (`KEY = value`) spellings are accepted in the
+file.
+
+Without a session the tests skip rather than fail, so an unconfigured checkout stays green. Each
+test creates a directory under the account's drive root and trashes it on teardown.
+
 
 ## License
 

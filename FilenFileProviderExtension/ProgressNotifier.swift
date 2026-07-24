@@ -21,7 +21,13 @@ final class ProgressNotifier: ProgressCallback {
 			return processed
 		}
 		let total = self.total.withLock { total in return total }
-		if processed >= total { let _ = self.set.withLock { set in set.remove(self.uuid) } }
+		// `total` is 0 until `setTotal` lands, and progress can arrive first — an unguarded
+		// `processed >= total` would treat the very first callback as completion and stop showing
+		// the transfer while it is still running. A transfer whose size is not known yet is never
+		// complete; `deinit` still clears the slot, so nothing gets stuck in flight.
+		if total > 0 && processed >= total {
+			let _ = self.set.withLock { set in set.remove(self.uuid) }
+		}
 	}
 
 	deinit { let _ = self.set.withLock { set in set.remove(self.uuid) } }

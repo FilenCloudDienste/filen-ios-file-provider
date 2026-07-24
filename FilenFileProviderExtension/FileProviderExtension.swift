@@ -19,16 +19,20 @@ let AUTH_DEK_ACCOUNT = "fileProviderAuthKey"
 class FileProviderExtension: NSFileProviderExtension {
 	private static let logger = Logger(subsystem: PROVIDER, category: "FileProvider")
 	let state: FilenMobileCacheState
-	var rootUuid: String?
+	// Lazily cached, and the system invokes the overrides below concurrently — so this needs the
+	// same locking as the two sets underneath it, not a bare var.
+	private let cachedRootUuid = OSAllocatedUnfairLock<String?>(initialState: nil)
 	public static var uploadingSet = OSAllocatedUnfairLock(initialState: Set<String>())
 	public static var downloadingSet = OSAllocatedUnfairLock(initialState: Set<String>())
 
 	// MARK: - Working with items and persistent identifiers
 
 	func getRootUuid() throws -> String {
-		if let rootUuid = self.rootUuid { return rootUuid }
+		if let cached = self.cachedRootUuid.withLock({ $0 }) { return cached }
+		// Fetched outside the lock: it can throw and hits the cache DB, and a duplicate fetch on a
+		// cold race is harmless — both callers compute the same immutable root uuid.
 		let uuid = try self.state.rootUuid()
-		self.rootUuid = uuid
+		self.cachedRootUuid.withLock { $0 = uuid }
 		return uuid
 	}
 
@@ -141,9 +145,63 @@ class FileProviderExtension: NSFileProviderExtension {
 			dek: Self.loadAuthDek())
 	}
 
+	/// The identifier handed to the system for an object: the whole-life
+	/// stable id for files and directories (identifiers must not change when
+	/// an item is edited, moved, or renamed), `fallback` for the root.
+	/// Static because this is the single place deciding that files key off their stable id and
+	/// directories off their uuid — the whole-life-identity invariant. Keeping it free of `self`
+	/// makes it directly testable.
+	static func itemIdentifier(for object: FfiObject, fallback: String)
+		-> NSFileProviderItemIdentifier
+	{
+		switch object {
+		case .file(let ffiFile):
+			return NSFileProviderItemIdentifier("stable/" + ffiFile.stableUuid)
+		case .dir(let ffiDir):
+			// dirs have no stable id on the wire, by design: stable == uuid
+			return NSFileProviderItemIdentifier("stable/" + ffiDir.uuid)
+		case .root(_): return NSFileProviderItemIdentifier(fallback)
+		}
+	}
+
+	/// The identifier of the container an object lives in (the original parent
+	/// while trashed). Containers are directories, whose stable id IS their
+	/// uuid, so no cache lookup is needed. Falls back to path-splitting the
+	/// item's own identifier, which preserves the legacy behavior for path ids.
+	///
+	/// `rootUuid` is passed in rather than read from `self` so the mapping is testable; nil simply
+	/// means the root is unknown, in which case no identifier can be the root container.
+	static func containerIdentifier(
+		for object: FfiObject, fallbackFrom identifier: NSFileProviderItemIdentifier,
+		rootUuid: String?
+	) -> NSFileProviderItemIdentifier {
+		guard let parentUuid = objectToContainerUuid(object: object) else {
+			return getParentItemIdentifier(itemIdentifier: identifier)
+		}
+		if parentUuid == rootUuid { return .rootContainer }
+		return NSFileProviderItemIdentifier("stable/" + parentUuid)
+	}
+
+	/// Instance convenience supplying the cached root uuid.
+	func containerIdentifier(
+		for object: FfiObject, fallbackFrom identifier: NSFileProviderItemIdentifier
+	) -> NSFileProviderItemIdentifier {
+		Self.containerIdentifier(
+			for: object, fallbackFrom: identifier, rootUuid: try? self.getRootUuid())
+	}
+
 	override func persistentIdentifierForItem(at url: URL) -> NSFileProviderItemIdentifier? {
 		let uuid = url.pathComponents[url.pathComponents.count - 2]
 		do {
+			// items persist under their stable id; the uuid lookup below also
+			// resolves a superseded uuid left in a stale URL
+			if let object = try self.state.queryItemByUuid(uuid: uuid) {
+				switch object {
+				case .file(_), .dir(_):
+					return Self.itemIdentifier(for: object, fallback: uuid)
+				case .root(_): break
+				}
+			}
 			guard let path = try self.state.queryPathForUuid(uuid: uuid) else {
 				Self.logger.error("no path for uuid \(uuid)")
 				return nil
@@ -194,7 +252,9 @@ class FileProviderExtension: NSFileProviderExtension {
 			as CacheError
 		{ throw cacheErrorToError(error: cacheError) }
 		guard let object = object else { throw NSFileProviderError(.noSuchItem) }
-		return FileProviderItem(itemIdentifier: identifier, object: object)
+		return FileProviderItem(
+			itemIdentifier: identifier, object: object,
+			parentItemIdentifier: self.containerIdentifier(for: object, fallbackFrom: identifier))
 	}
 
 	override func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier) throws
@@ -202,29 +262,74 @@ class FileProviderExtension: NSFileProviderExtension {
 	{
 		do {
 			return FileProviderEnumerator(
-				enumeratedItemIdentifier: containerItemIdentifier, ext: self,
+				enumeratedItemIdentifier: containerItemIdentifier, state: self.state,
 				rootUuid: try self.getRootUuid())
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
 	// MARK: - Managing shared files
 
+	/// What to do with a locally changed item, once its path lookup has been attempted.
+	enum ItemChangedResolution: Equatable {
+		/// Resolved — upload from this path.
+		case upload(String)
+		/// The cache genuinely does not know this uuid. There is nothing to retry.
+		case unknownItem
+		/// The lookup itself failed, so we do not know whether the item exists. The edit must not
+		/// be dropped silently — signal so the system asks again.
+		case needsRetry
+	}
+
+	/// Splits "look the item up" from "act on it" so the failure handling is testable.
+	///
+	/// A failed lookup and a missing item are NOT the same: swallowing a thrown lookup error would
+	/// strand a local edit with no upload and no retry signal, silently losing the user's change.
+	static func resolveItemChanged(
+		uuid: String, queryPath: (String) throws -> String?
+	) -> ItemChangedResolution {
+		do {
+			guard let path = try queryPath(uuid) else { return .unknownItem }
+			return .upload(path)
+		} catch {
+			return .needsRetry
+		}
+	}
+
 	override func itemChanged(at url: URL) {
 		let uuid = url.pathComponents[url.pathComponents.count - 2]
-		let path = try? self.state.queryPathForUuid(uuid: uuid)
-		guard let path = path else {
+		let resolution = Self.resolveItemChanged(uuid: uuid) { uuid in
+			try self.state.queryPathForUuid(uuid: uuid)
+		}
+
+		let path: String
+		switch resolution {
+		case .upload(let resolved):
+			path = resolved
+		case .unknownItem:
 			Self.logger.error("no item found for uuid \(uuid)")
 			return
+		case .needsRetry:
+			// TODO: there is no retry mechanism to reach for yet. Signalling the working set is
+			// the idiomatic way to ask the system to re-examine items needing sync, but this
+			// provider does not implement `enumerateChanges`, and the working set's sentinel is
+			// not even a resolvable cache id — enumerating it throws (pinned by
+			// CacheStableIdTests.testTheWorkingSetSentinelIsNotAResolvableCacheId). Signalling it
+			// would only generate error noise, so log loudly and drop through until working-set
+			// support lands.
+			Self.logger.error("could not resolve uuid \(uuid), local edit not uploaded")
+			return
 		}
+
 		Task {
 			do {
 				let _ = try await self.state.uploadFileIfChanged(
 					path: path,
 					progressCallback: ProgressNotifier(set: Self.uploadingSet, uuid: uuid))
 			} catch {
-				Self.logger.error("itemChanged failed for uuid \(uuid): \(error)")
-				// re-signal so the change is retried rather than lost
-				NSFileProviderManager.default.signalEnumerator(for: .workingSet) { _ in }
+				// TODO: same gap as the `.needsRetry` branch above — the working-set signal that
+				// used to sit here could never drive a retry, because enumerating the working set
+				// throws. A failed upload is currently lost until the item changes again.
+				Self.logger.error("itemChanged upload failed for uuid \(uuid), not persisted: \(error)")
 			}
 		}
 	}
@@ -287,8 +392,9 @@ class FileProviderExtension: NSFileProviderExtension {
 				parentPath: path, name: directoryName, created: nil)
 
 			return FileProviderItem(
-				itemIdentifier: NSFileProviderItemIdentifier(resp.id),
-				object: FfiObject.dir(resp.dir))
+				itemIdentifier: Self.itemIdentifier(for: FfiObject.dir(resp.dir), fallback: resp.id),
+				object: FfiObject.dir(resp.dir),
+				parentItemIdentifier: parentItemIdentifier)
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
@@ -328,8 +434,10 @@ class FileProviderExtension: NSFileProviderExtension {
 				let info = try await self.state.createDir(
 					parentPath: parent, name: name, created: creationTimeStamp)
 				item = FileProviderItem(
-					itemIdentifier: NSFileProviderItemIdentifier(info.id),
-					object: FfiObject.dir(info.dir))
+					itemIdentifier: Self.itemIdentifier(
+						for: FfiObject.dir(info.dir), fallback: info.id),
+					object: FfiObject.dir(info.dir),
+					parentItemIdentifier: parentItemIdentifier)
 			} else {
 				let modificationInterval = resourceValues.contentModificationDate?
 					.timeIntervalSince1970
@@ -341,8 +449,10 @@ class FileProviderExtension: NSFileProviderExtension {
 					osPath: fileURL.path(percentEncoded: false), parentPath: parent, info: info,
 					progressCallback: nil)
 				item = FileProviderItem(
-					itemIdentifier: NSFileProviderItemIdentifier(resp.id),
-					object: FfiObject.file(resp.file))
+					itemIdentifier: Self.itemIdentifier(
+						for: FfiObject.file(resp.file), fallback: resp.id),
+					object: FfiObject.file(resp.file),
+					parentItemIdentifier: parentItemIdentifier)
 			}
 			return item
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
@@ -355,8 +465,11 @@ class FileProviderExtension: NSFileProviderExtension {
 			let resp = try await self.state.renameItem(
 				item: itemIdentifier.rawValue, newName: itemName)
 			guard let item = resp else { throw NSFileProviderError(.filenameCollision) }
+			let identifier = Self.itemIdentifier(for: item.object, fallback: item.id)
 			return FileProviderItem(
-				itemIdentifier: NSFileProviderItemIdentifier(item.id), object: item.object)
+				itemIdentifier: identifier, object: item.object,
+				parentItemIdentifier: self.containerIdentifier(
+					for: item.object, fallbackFrom: identifier))
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
@@ -374,7 +487,9 @@ class FileProviderExtension: NSFileProviderExtension {
 				item: itemIdentifier.rawValue, newParent: newParent)
 
 			let item = FileProviderItem(
-				itemIdentifier: NSFileProviderItemIdentifier(resp.id), object: resp.object)
+				itemIdentifier: Self.itemIdentifier(for: resp.object, fallback: resp.id),
+				object: resp.object,
+				parentItemIdentifier: parentItemIdentifier)
 			if let newName = newName {
 				if item.filename == newName { return item }  // no need to rename if the name is the same
 				// if a new name is provided, we rename the item
@@ -382,7 +497,9 @@ class FileProviderExtension: NSFileProviderExtension {
 
 				guard let item = resp else { throw NSFileProviderError(.filenameCollision) }
 				return FileProviderItem(
-					itemIdentifier: NSFileProviderItemIdentifier(item.id), object: item.object)
+					itemIdentifier: Self.itemIdentifier(for: item.object, fallback: item.id),
+					object: item.object,
+					parentItemIdentifier: parentItemIdentifier)
 			} else {
 				return item
 			}
@@ -395,8 +512,11 @@ class FileProviderExtension: NSFileProviderExtension {
 		do {
 			let resp = try await self.state.setFavoriteRank(
 				item: itemIdentifier.rawValue, favoriteRank: favoriteRank?.int64Value ?? 0)
+			let identifier = Self.itemIdentifier(for: resp.object, fallback: resp.id)
 			return FileProviderItem(
-				itemIdentifier: NSFileProviderItemIdentifier(resp.id), object: resp.object)
+				itemIdentifier: identifier, object: resp.object,
+				parentItemIdentifier: self.containerIdentifier(
+					for: resp.object, fallbackFrom: identifier))
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
@@ -408,7 +528,10 @@ class FileProviderExtension: NSFileProviderExtension {
 			let stringData = tagData?.count ?? 0 > 0 ? tagData?.base64EncodedString() : nil
 			let obj = try self.state.insertIntoLocalDataForPath(
 				path: itemIdentifier.rawValue, key: "TagData", value: stringData)
-			return FileProviderItem(itemIdentifier: itemIdentifier, object: obj)
+			return FileProviderItem(
+				itemIdentifier: itemIdentifier, object: obj,
+				parentItemIdentifier: self.containerIdentifier(
+					for: obj, fallbackFrom: itemIdentifier))
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
@@ -417,11 +540,17 @@ class FileProviderExtension: NSFileProviderExtension {
 	{
 		do {
 			let resp = try await self.state.trashItem(path: itemIdentifier.rawValue)
+			// signal the container the item vanished from — its ORIGINAL
+			// parent, which the trash response still carries (a stable file
+			// identifier has no path structure to split a parent out of)
 			try await NSFileProviderManager.default.signalEnumerator(
-				for: getParentItemIdentifier(itemIdentifier: itemIdentifier))
+				for: self.containerIdentifier(for: resp.object, fallbackFrom: itemIdentifier))
 
 			return FileProviderItem(
-				itemIdentifier: NSFileProviderItemIdentifier(resp.id), object: resp.object)
+				itemIdentifier: Self.itemIdentifier(for: resp.object, fallback: resp.id),
+				object: resp.object,
+				parentItemIdentifier: self.containerIdentifier(
+					for: resp.object, fallbackFrom: itemIdentifier))
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
@@ -442,8 +571,11 @@ class FileProviderExtension: NSFileProviderExtension {
 				} else { nil }
 			let resp = try await self.state.restoreItem(
 				uuid: uuid, to: target)
+			let identifier = Self.itemIdentifier(for: resp.object, fallback: resp.id)
 			return FileProviderItem(
-				itemIdentifier: NSFileProviderItemIdentifier(resp.id), object: resp.object)
+				itemIdentifier: identifier, object: resp.object,
+				parentItemIdentifier: self.containerIdentifier(
+					for: resp.object, fallbackFrom: identifier))
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
