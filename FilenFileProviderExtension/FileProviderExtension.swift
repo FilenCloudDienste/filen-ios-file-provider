@@ -146,6 +146,22 @@ class FileProviderExtension: NSFileProviderExtension {
 			dbDir: dbDir.path(percentEncoded: false),
 			authFile: authFile,
 			dek: Self.loadAuthDek())
+
+		// An edit whose upload failed stays marked in the cache, and nothing drains those markers
+		// on its own — the system calls `itemChanged` once and never again. This process is the
+		// only thing that reliably runs after a failure, so drain on the way up. Detached and
+		// unawaited: a slow drain must not delay the first operation the system asks for.
+		let state = self.state
+		Task.detached(priority: .utility) {
+			do {
+				let uploaded = try await state.retryPendingUploads()
+				if uploaded > 0 {
+					Self.logger.info("Recovered \(uploaded) pending upload(s) on launch")
+				}
+			} catch {
+				Self.logger.error("Draining pending uploads failed: \(error)")
+			}
+		}
 	}
 
 	/// The identifier handed to the system for an object: the whole-life
