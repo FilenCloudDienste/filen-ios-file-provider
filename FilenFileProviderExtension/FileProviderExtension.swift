@@ -22,6 +22,9 @@ class FileProviderExtension: NSFileProviderExtension {
 	// Lazily cached, and the system invokes the overrides below concurrently — so this needs the
 	// same locking as the two sets underneath it, not a bare var.
 	private let cachedRootUuid = OSAllocatedUnfairLock<String?>(initialState: nil)
+	/// Attempts for an `itemChanged` upload before the edit is given up on. Three with exponential
+	/// backoff covers a transient blip without keeping a suspended-at-any-moment extension busy.
+	static let uploadAttempts = 3
 	public static var uploadingSet = TransfersInFlight(initialState: [:])
 	public static var downloadingSet = TransfersInFlight(initialState: [:])
 
@@ -298,6 +301,31 @@ class FileProviderExtension: NSFileProviderExtension {
 		}
 	}
 
+	/// Runs an operation, retrying a bounded number of times; nil on success, else the last error.
+	///
+	/// A failed upload out of `itemChanged` is a lost user edit — nothing re-triggers
+	/// `itemChanged`, and the working-set signal that would normally ask the system to re-examine
+	/// the item does not work here (see the TODOs below). Retrying recovers transient failures, a
+	/// dropped connection or a server blip, which are the common case. It cannot recover a
+	/// permanent failure or a process death mid-retry; those still need working-set support.
+	static func retrying(
+		attempts: Int,
+		operation: () async throws -> Void,
+		onRetry: (Int) async -> Void = { _ in }
+	) async -> Error? {
+		var lastError: Error?
+		for attempt in 1...max(1, attempts) {
+			do {
+				try await operation()
+				return nil
+			} catch {
+				lastError = error
+				if attempt < attempts { await onRetry(attempt) }
+			}
+		}
+		return lastError
+	}
+
 	override func itemChanged(at url: URL) {
 		guard let uuid = uuidFromCacheItemURL(url) else {
 			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
@@ -327,15 +355,29 @@ class FileProviderExtension: NSFileProviderExtension {
 		}
 
 		Task {
-			do {
-				let _ = try await self.state.uploadFileIfChanged(
-					path: path,
-					progressCallback: ProgressNotifier(set: Self.uploadingSet, uuid: uuid))
-			} catch {
-				// TODO: same gap as the `.needsRetry` branch above — the working-set signal that
-				// used to sit here could never drive a retry, because enumerating the working set
-				// throws. A failed upload is currently lost until the item changes again.
-				Self.logger.error("itemChanged upload failed for uuid \(uuid), not persisted: \(error)")
+			// A fresh notifier per attempt: each one holds its own slot and releases it on the way
+			// out, so a retry re-marks the item as uploading.
+			let failure = await Self.retrying(
+				attempts: Self.uploadAttempts,
+				operation: {
+					let _ = try await self.state.uploadFileIfChanged(
+						path: path,
+						progressCallback: ProgressNotifier(set: Self.uploadingSet, uuid: uuid))
+				},
+				onRetry: { attempt in
+					Self.logger.error("itemChanged upload attempt \(attempt) failed for \(uuid)")
+					try? await Task.sleep(for: .seconds(1 << (attempt - 1)))
+				})
+
+			if let failure {
+				// TODO: the retries are exhausted and there is nothing left to fall back on. The
+				// idiomatic move is to signal the working set so the system re-examines the item,
+				// but this provider does not implement `enumerateChanges` and the working set's
+				// sentinel is not a resolvable cache id — enumerating it throws (pinned by
+				// CacheStableIdTests.testTheWorkingSetSentinelIsNotAResolvableCacheId). Until that
+				// lands, an edit that fails this many times is lost until the item changes again.
+				Self.logger.error(
+					"itemChanged upload failed for uuid \(uuid), not persisted: \(failure)")
 			}
 		}
 	}
