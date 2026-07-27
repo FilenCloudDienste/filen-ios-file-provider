@@ -380,6 +380,14 @@ class FileProviderExtension: NSFileProviderExtension {
 			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
 			return
 		}
+		// KNOWN GAP: this detached Task is uncancellable and nothing orders it against a
+		// subsequent download of the same uuid — `clear_local_cache_by_uuid` selects then deletes
+		// with no per-uuid lock on the Rust side either (remote.rs:842). If the system stops
+		// providing an item and immediately re-requests it, the clear can land after the fresh
+		// download and evict it, and the next open re-downloads. Recoverable and transient, so it
+		// is documented rather than worked around; the fix is per-uuid serialisation in the cache,
+		// not here. Deliberately untested: any assertion about which of two unordered operations
+		// wins would be flaky by construction.
 		Task {
 			do {
 				try await self.state.clearLocalCacheByUuid(uuid: uuid)

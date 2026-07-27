@@ -180,6 +180,32 @@ final class CacheStableIdTests: XCTestCase {
 			"expected a name path ending in the file name, got \(path)")
 	}
 
+	/// End-to-end counterpart to the unit repro in IdentifierTests: trashing a file nested two
+	/// levels deep must leave it reporting the folder it came from, not the drive root.
+	///
+	/// The unit test builds the FfiFile by hand; this proves the server and cache actually populate
+	/// `originalParent` the way that resolution depends on.
+	func testTrashingANestedFileKeepsItsOriginalContainer() async throws {
+		let dir = try await makeIsolatedDir("stable-trash")
+		let inner = try await state.createDir(parentPath: dir.id, name: "inner", created: nil)
+		let created = try await state.createEmptyFile(
+			parentPath: inner.id, name: "doomed.txt", mime: "text/plain")
+
+		let trashed = try await state.trashItem(path: "stable/\(created.file.stableUuid)")
+
+		// The identity survives the trash round-trip.
+		XCTAssertEqual(try stableIdentity(of: trashed.object), created.file.stableUuid)
+
+		let container = FileProviderExtension.containerIdentifier(
+			for: trashed.object,
+			fallbackFrom: NSFileProviderItemIdentifier("stable/\(created.file.stableUuid)"),
+			rootUuid: rootUuid)
+		XCTAssertEqual(
+			container, NSFileProviderItemIdentifier("stable/\(inner.dir.uuid)"),
+			"a trashed file must resolve to the folder it will be restored into")
+		XCTAssertNotEqual(container, .rootContainer, "and never to the drive root")
+	}
+
 	/// The working set is NOT a resolvable cache id, which is why enumerating it cannot work today.
 	///
 	/// `enumerator(for:)` builds an enumerator for any container, but `FileProviderEnumerator`'s
