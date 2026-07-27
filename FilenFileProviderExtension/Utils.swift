@@ -44,6 +44,19 @@ func cacheErrorToError(error: CacheError) -> any Error {
 	}
 }
 
+/// The uuid out of a cache item URL, which is shaped `.../<uuid>/<filename>`.
+///
+/// Nil when the URL is too short to have that shape. Reading the index directly would TRAP on a
+/// short URL, and a trap cannot be intercepted by `do`/`catch` — it takes the whole extension
+/// process down instead of failing the one operation.
+func uuidFromCacheItemURL(_ url: URL) -> String? {
+	// At least root + uuid + filename: `pathComponents` includes the leading "/", so a shorter URL
+	// has no uuid position and would otherwise hand back "/" as if it were one.
+	let components = url.pathComponents
+	guard components.count >= 3 else { return nil }
+	return components[components.count - 2]
+}
+
 func objectToUuid(object: FfiObject) -> String {
 	switch object {
 	case .file(let file): return file.uuid

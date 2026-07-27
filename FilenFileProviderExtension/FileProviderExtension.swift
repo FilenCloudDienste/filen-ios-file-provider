@@ -191,7 +191,10 @@ class FileProviderExtension: NSFileProviderExtension {
 	}
 
 	override func persistentIdentifierForItem(at url: URL) -> NSFileProviderItemIdentifier? {
-		let uuid = url.pathComponents[url.pathComponents.count - 2]
+		guard let uuid = uuidFromCacheItemURL(url) else {
+			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
+			return nil
+		}
 		do {
 			// items persist under their stable id; the uuid lookup below also
 			// resolves a superseded uuid left in a stale URL
@@ -296,7 +299,10 @@ class FileProviderExtension: NSFileProviderExtension {
 	}
 
 	override func itemChanged(at url: URL) {
-		let uuid = url.pathComponents[url.pathComponents.count - 2]
+		guard let uuid = uuidFromCacheItemURL(url) else {
+			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
+			return
+		}
 		let resolution = Self.resolveItemChanged(uuid: uuid) { uuid in
 			try self.state.queryPathForUuid(uuid: uuid)
 		}
@@ -354,7 +360,9 @@ class FileProviderExtension: NSFileProviderExtension {
 
 	override func startProvidingItem(at url: URL) async throws {
 		do {
-			let uuid = url.pathComponents[url.pathComponents.count - 2]
+			guard let uuid = uuidFromCacheItemURL(url) else {
+				throw NSFileProviderError(.noSuchItem)
+			}
 			guard let obj = try self.state.queryItemByUuid(uuid: uuid) else {
 				throw NSFileProviderError(.noSuchItem)
 			}
@@ -368,7 +376,10 @@ class FileProviderExtension: NSFileProviderExtension {
 	}
 
 	override func stopProvidingItem(at url: URL) {
-		let uuid = url.pathComponents[url.pathComponents.count - 2]
+		guard let uuid = uuidFromCacheItemURL(url) else {
+			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
+			return
+		}
 		Task {
 			do {
 				try await self.state.clearLocalCacheByUuid(uuid: uuid)
