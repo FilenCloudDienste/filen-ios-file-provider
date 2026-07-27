@@ -73,17 +73,33 @@ final class ThumbnailHandlerTests: XCTestCase {
 		XCTAssertEqual((error as? NSError)?.domain, NSFileProviderErrorDomain)
 	}
 
-	/// A path that cannot be read collapses through `try?` to "no data, no error", which the system
-	/// cannot tell apart from a genuine `.noThumbnail`. Pinned so the ambiguity is visible; the fix
-	/// is to report an error when a promised file is unreadable.
-	func testAnUnreadableThumbnailPathIsIndistinguishableFromHavingNone() {
+	/// A promised thumbnail that cannot be read is an error, not "this item has no thumbnail".
+	/// Collapsing the two would make the system cache "none" instead of retrying.
+	func testAnUnreadableThumbnailPathReportsAnError() throws {
 		let (handler, recorder, _) = makeHandler()
 
 		handler.process(id: "d", result: .ok("/nonexistent/thumbnail.jpg"))
 
-		let (_, data, error) = try! XCTUnwrap(recorder.all.first)
+		let (_, data, error) = try XCTUnwrap(recorder.all.first)
 		XCTAssertNil(data)
-		XCTAssertNil(error, "known limitation: an unreadable path reports as no-thumbnail")
+		XCTAssertNotNil(
+			error, "an unreadable promised file must not be reported as having no thumbnail")
+	}
+
+	/// A readable path returns its bytes and no error.
+	func testAReadableThumbnailPathReturnsItsData() throws {
+		let (handler, recorder, _) = makeHandler()
+		let url = FileManager.default.temporaryDirectory
+			.appending(component: "thumb-\(UUID().uuidString).bin")
+		let expected = Data([0xDE, 0xAD, 0xBE, 0xEF])
+		try expected.write(to: url)
+		defer { try? FileManager.default.removeItem(at: url) }
+
+		handler.process(id: "e", result: .ok(url.path(percentEncoded: false)))
+
+		let (_, data, error) = try XCTUnwrap(recorder.all.first)
+		XCTAssertEqual(data, expected)
+		XCTAssertNil(error)
 	}
 
 	// MARK: - Progress accounting

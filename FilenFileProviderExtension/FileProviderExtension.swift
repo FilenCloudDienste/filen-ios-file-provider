@@ -22,8 +22,8 @@ class FileProviderExtension: NSFileProviderExtension {
 	// Lazily cached, and the system invokes the overrides below concurrently — so this needs the
 	// same locking as the two sets underneath it, not a bare var.
 	private let cachedRootUuid = OSAllocatedUnfairLock<String?>(initialState: nil)
-	public static var uploadingSet = OSAllocatedUnfairLock(initialState: Set<String>())
-	public static var downloadingSet = OSAllocatedUnfairLock(initialState: Set<String>())
+	public static var uploadingSet = TransfersInFlight(initialState: [:])
+	public static var downloadingSet = TransfersInFlight(initialState: [:])
 
 	// MARK: - Working with items and persistent identifiers
 
@@ -492,37 +492,70 @@ class FileProviderExtension: NSFileProviderExtension {
 		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 
+	/// Moves an item and optionally renames it, rolling the move back if the rename fails.
+	///
+	/// The two steps are separate server calls with no transaction between them. Without the
+	/// rollback a failed rename reports total failure while the move has already committed, so the
+	/// system keeps showing the item in its old container while the server has it in the new one.
+	/// Compensating means a thrown error truthfully says "nothing changed".
+	///
+	/// Static, and taking `state`, so the sequence is testable without a FileProviderExtension.
+	static func reparent(
+		state: FilenMobileCacheState,
+		itemIdentifier: NSFileProviderItemIdentifier,
+		newParent: String,
+		newName: String?,
+		parentItemIdentifier: NSFileProviderItemIdentifier
+	) async throws -> FileProviderItem {
+		do {
+			// Captured before the move so the rollback knows where to put the item back.
+			let originalParent = (try? state.queryItem(path: itemIdentifier.rawValue))
+				.flatMap { $0 }
+				.flatMap { objectToContainerUuid(object: $0) }
+
+			let resp = try await state.moveItem(item: itemIdentifier.rawValue, newParent: newParent)
+			let moved = FileProviderItem(
+				itemIdentifier: Self.itemIdentifier(for: resp.object, fallback: resp.id),
+				object: resp.object,
+				parentItemIdentifier: parentItemIdentifier)
+
+			guard let newName = newName, moved.filename != newName else { return moved }
+
+			do {
+				guard let renamed = try await state.renameItem(item: resp.id, newName: newName)
+				else { throw NSFileProviderError(.filenameCollision) }
+				return FileProviderItem(
+					itemIdentifier: Self.itemIdentifier(for: renamed.object, fallback: renamed.id),
+					object: renamed.object,
+					parentItemIdentifier: parentItemIdentifier)
+			} catch {
+				// Best effort: if the rollback itself fails there is nothing further to try, but
+				// the original error is still the truthful one to report.
+				if let originalParent {
+					do {
+						_ = try await state.moveItem(item: resp.id, newParent: originalParent)
+					} catch let rollbackError {
+						Self.logger.error(
+							"reparent rollback failed, item left moved: \(rollbackError)")
+					}
+				}
+				throw error
+			}
+		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
+	}
+
 	override func reparentItem(
 		withIdentifier itemIdentifier: NSFileProviderItemIdentifier,
 		toParentItemWithIdentifier parentItemIdentifier: NSFileProviderItemIdentifier,
 		newName: String?
 	) async throws -> NSFileProviderItem {
-		do {
-			let newParent =
-				if parentItemIdentifier == .rootContainer { try self.getRootUuid() } else {
-					parentItemIdentifier.rawValue
-				}
-			let resp = try await self.state.moveItem(
-				item: itemIdentifier.rawValue, newParent: newParent)
-
-			let item = FileProviderItem(
-				itemIdentifier: Self.itemIdentifier(for: resp.object, fallback: resp.id),
-				object: resp.object,
-				parentItemIdentifier: parentItemIdentifier)
-			if let newName = newName {
-				if item.filename == newName { return item }  // no need to rename if the name is the same
-				// if a new name is provided, we rename the item
-				let resp = try await self.state.renameItem(item: resp.id, newName: newName)
-
-				guard let item = resp else { throw NSFileProviderError(.filenameCollision) }
-				return FileProviderItem(
-					itemIdentifier: Self.itemIdentifier(for: item.object, fallback: item.id),
-					object: item.object,
-					parentItemIdentifier: parentItemIdentifier)
-			} else {
-				return item
+		let newParent =
+			if parentItemIdentifier == .rootContainer { try self.getRootUuid() } else {
+				parentItemIdentifier.rawValue
 			}
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
+		return try await Self.reparent(
+			state: self.state, itemIdentifier: itemIdentifier, newParent: newParent,
+			newName: newName, parentItemIdentifier: parentItemIdentifier)
 	}
 
 	override func setFavoriteRank(

@@ -222,11 +222,11 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 
 	var isUploading: Bool {
 		let uuid = objectToUuid(object: self.object)
-		return FileProviderExtension.uploadingSet.withLock { set in return set.contains(uuid) }
+		return FileProviderExtension.uploadingSet.withLock { transfers in transfers[uuid] != nil }
 	}
 
 	var isDownloading: Bool {
 		let uuid = objectToUuid(object: self.object)
-		return FileProviderExtension.downloadingSet.withLock { set in return set.contains(uuid) }
+		return FileProviderExtension.downloadingSet.withLock { transfers in transfers[uuid] != nil }
 	}
 }

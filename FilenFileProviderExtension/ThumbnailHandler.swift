@@ -24,9 +24,17 @@ final class FetchThumbnailHandler: ThumbnailCallback {
 
 		switch result {
 		case .ok(let path):
-			let data = try? Data(contentsOf: URL(fileURLWithPath: path))
-			self.perThumbnailCompletionHandler(NSFileProviderItemIdentifier(id), data, nil)
-		// todo
+			// The cache promised a thumbnail at this path, so failing to read it is a real error.
+			// Reporting (nil, nil) would be indistinguishable from `.noThumbnail` — i.e. from the
+			// item legitimately having no thumbnail — so the system would cache "none" instead of
+			// retrying.
+			do {
+				let data = try Data(contentsOf: URL(fileURLWithPath: path))
+				self.perThumbnailCompletionHandler(NSFileProviderItemIdentifier(id), data, nil)
+			} catch {
+				Self.logger.error("Thumbnail for \(id) unreadable at \(path): \(error)")
+				self.perThumbnailCompletionHandler(NSFileProviderItemIdentifier(id), nil, error)
+			}
 		case .notFound:
 			self.perThumbnailCompletionHandler(
 				NSFileProviderItemIdentifier(id), nil, NSFileProviderError(.noSuchItem))

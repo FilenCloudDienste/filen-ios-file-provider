@@ -180,6 +180,54 @@ final class CacheStableIdTests: XCTestCase {
 			"expected a name path ending in the file name, got \(path)")
 	}
 
+	/// A move followed by a failing rename must not leave the item moved.
+	///
+	/// The two steps are separate server calls with no transaction. Previously the move committed
+	/// and then a failing rename threw, telling the system the whole operation failed while the
+	/// item had in fact moved — so the Files app showed it in its old folder while the server had
+	/// it in the new one, and the divergence persisted until something forced a re-listing.
+	func testAFailedRenameDoesNotLeaveTheItemMoved() async throws {
+		let root = try await makeIsolatedDir("stable-reparent")
+		let from = try await state.createDir(parentPath: root.id, name: "from", created: nil)
+		let to = try await state.createDir(parentPath: root.id, name: "to", created: nil)
+		let created = try await state.createEmptyFile(
+			parentPath: from.id, name: "movable.txt", mime: "text/plain")
+		let stableId = NSFileProviderItemIdentifier("stable/\(created.file.stableUuid)")
+
+		// "/" is rejected as a filename, so the rename fails deterministically after the move.
+		do {
+			_ = try await FileProviderExtension.reparent(
+				state: state, itemIdentifier: stableId, newParent: to.id, newName: "bad/name",
+				parentItemIdentifier: NSFileProviderItemIdentifier(to.id))
+			XCTFail("a rename to an invalid name should not succeed")
+		} catch {
+			// expected
+		}
+
+		let after = try XCTUnwrap(state.queryItem(path: stableId.rawValue))
+		XCTAssertEqual(
+			objectToContainerUuid(object: after), from.dir.uuid,
+			"a failed rename must roll the move back, so the reported failure is truthful")
+	}
+
+	/// The successful path still moves and renames in one call.
+	func testAReparentWithARenameMovesAndRenames() async throws {
+		let root = try await makeIsolatedDir("stable-reparent-ok")
+		let from = try await state.createDir(parentPath: root.id, name: "from", created: nil)
+		let to = try await state.createDir(parentPath: root.id, name: "to", created: nil)
+		let created = try await state.createEmptyFile(
+			parentPath: from.id, name: "before.txt", mime: "text/plain")
+		let stableId = NSFileProviderItemIdentifier("stable/\(created.file.stableUuid)")
+
+		let item = try await FileProviderExtension.reparent(
+			state: state, itemIdentifier: stableId, newParent: to.id, newName: "after.txt",
+			parentItemIdentifier: NSFileProviderItemIdentifier(to.id))
+
+		XCTAssertEqual(item.filename, "after.txt")
+		let after = try XCTUnwrap(state.queryItem(path: stableId.rawValue))
+		XCTAssertEqual(objectToContainerUuid(object: after), to.dir.uuid)
+	}
+
 	/// End-to-end counterpart to the unit repro in IdentifierTests: trashing a file nested two
 	/// levels deep must leave it reporting the folder it came from, not the drive root.
 	///
