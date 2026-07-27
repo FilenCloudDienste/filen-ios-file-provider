@@ -162,37 +162,35 @@ final class EnumeratorTests: XCTestCase {
 		}
 	}
 
-	/// CONFIRMED GAP: the trash container can never be enumerated.
-	///
-	/// `FileProviderEnumerator` substitutes the cache's "trash" form for the sentinel
-	/// (FileProviderEnumerator.swift:21-23) and then goes through the generic `queryItem` /
-	/// `updateAndQueryDirChildren` path. But the trash is not a cached item — it is reachable only
-	/// through the separate `queryTrash` / `updateTrash` API, which the enumerator never calls. So
-	/// `queryItem(path: "trash")` always misses and the Files app's trash view errors.
-	///
-	/// The companion test below rules out "the cache just wasn't warm": populating the trash first
-	/// changes nothing. Fixing this means routing `.trashContainer` to `queryTrash`; pinned here so
-	/// the fix has a target and the regression is visible.
-	func testTheTrashContainerCannotBeEnumerated() throws {
+	/// The trash is not a cached directory — it is reachable only through the dedicated
+	/// `queryTrash` / `updateTrash` API, so the enumerator must route `.trashContainer` there
+	/// rather than through the generic `queryItem` / `updateAndQueryDirChildren` path.
+	func testTheTrashContainerEnumerates() throws {
 		let observer = try enumerate(.trashContainer)
 
-		let error = try XCTUnwrap(
-			observer.failure, "known gap: the trash container does not enumerate") as NSError
-		XCTAssertEqual(error.domain, NSFileProviderErrorDomain)
-		XCTAssertEqual(error.code, NSFileProviderError.noSuchItem.rawValue)
+		XCTAssertNil(
+			observer.failure, "the trash container must enumerate, even when it holds nothing")
+		XCTAssertTrue(observer.didFinish)
 	}
 
-	/// Populating the trash through its own API does NOT make the container enumerable, which
-	/// isolates the gap to the enumerator using the wrong cache API rather than a cold cache.
-	func testPopulatingTheTrashDoesNotMakeTheContainerEnumerable() async throws {
-		try await state.updateTrash()
+	/// A trashed item must actually show up in the trash listing, reporting the trash sentinel as
+	/// its parent so the Files app files it under Recently Deleted rather than the drive root.
+	func testATrashedItemAppearsInTheTrashContainer() async throws {
+		let name = "enum-\(UUID().uuidString)"
+		let dir = try await state.createDir(parentPath: rootUuid, name: name, created: nil)
+		createdRootDirId = dir.id
+		_ = try await state.trashItem(path: dir.id)
+		// Already trashed; tearDown must not try again.
+		createdRootDirId = nil
 
 		let observer = try enumerate(.trashContainer)
 
-		XCTAssertNotNil(
-			observer.failure,
-			"the trash is not a cached item — only queryTrash reaches it, so a warm cache "
-				+ "changes nothing")
+		XCTAssertNil(observer.failure)
+		let match = observer.enumerated.first { $0.filename == name }
+		let found = try XCTUnwrap(match, "the trashed directory should appear in the trash")
+		XCTAssertEqual(
+			found.parentItemIdentifier, .trashContainer,
+			"a trashed item must report the trash sentinel as its parent")
 	}
 
 	/// Enumerating a file is a no-op that finishes cleanly rather than erroring — only directories

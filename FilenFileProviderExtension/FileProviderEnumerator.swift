@@ -30,10 +30,34 @@ class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 		// with paged approach in api v4 we could probably make use of this
 	}
 
+	/// The trash is not a cached directory — `queryItem` can never resolve it, so it has its own
+	/// pair of cache calls. Routing it through the generic child-listing path below would always
+	/// miss and surface as "no such item" in the Files app's Recently Deleted view.
+	private func enumerateTrash(for observer: any NSFileProviderEnumerationObserver) async {
+		do {
+			try await self.state.updateTrash()
+			let response = try self.state.queryTrash(orderBy: nil)
+			let items = response.objects.map {
+				FileProviderItem(parentItemIdentifier: .trashContainer, object: $0)
+			}
+			observer.didEnumerate(items)
+			observer.finishEnumerating(upTo: nil)
+		} catch let error as CacheError {
+			observer.finishEnumeratingWithError(cacheErrorToError(error: error))
+		} catch {
+			observer.finishEnumeratingWithError(error)
+		}
+	}
+
 	func enumerateItems(
 		for observer: any NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage
 	) {
 		Task {
+			if self.reportedContainerIdentifier == NSFileProviderItemIdentifier.trashContainer {
+				await self.enumerateTrash(for: observer)
+				return
+			}
+
 			do {
 				guard
 					let object = try self.state.queryItem(
