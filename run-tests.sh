@@ -60,6 +60,13 @@ load_env_file() {
 			esac
 		fi
 
+		# Undo the xcconfig escape the checked-in .env.example prescribes: xcconfig treats `//`
+		# as a comment, so a `//` inside a base64 key is written `/$()/` — an empty variable
+		# substitution xcconfig eats and nothing else does. Reading the file as-is here would
+		# hand a `$` to a base64 decoder and fail auth with no explanation. `$()` cannot occur in
+		# base64 or in any of the other values, so removing it outright is safe.
+		value=${value//'$()'/}
+
 		for name in "${required[@]}"; do
 			if [ "$key" = "$name" ]; then
 				printf -v "$key" '%s' "$value"
