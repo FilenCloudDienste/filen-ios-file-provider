@@ -137,6 +137,11 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 					observer.finishEnumeratingChanges(
 						upTo: NSFileProviderSyncAnchor(changes.anchor), moreComing: changes.more)
 				}
+
+				// Nothing more to do here for working-set tracking: `enumerateChanges` above
+				// already spawns exactly this reconcile off the caller's path — that is what makes
+				// it the backstop refresh point. Awaiting a second, identical one only kept the
+				// system waiting on the cache's own bookkeeping.
 			} catch CacheError.SyncAnchorExpired(_) {
 				// The one failure that is not an error: the system drops what it has and asks
 				// again from nothing. The stashed anchor belongs to the dead incarnation —

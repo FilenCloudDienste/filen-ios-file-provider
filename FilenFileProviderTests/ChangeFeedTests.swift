@@ -270,4 +270,62 @@ final class ChangeFeedTests: XCTestCase {
 		XCTAssertEqual(item.itemIdentifier, .trashContainer)
 		XCTAssertFalse(item.filename.isEmpty)
 	}
+
+	// MARK: - Working-set tracking
+
+	/// Counts the "something in your working set moved" signals the cache raises.
+	private final class SignalCounter: WorkingSetUpdateListener, @unchecked Sendable {
+		private let lock = NSLock()
+		private var signals = 0
+
+		func workingSetChanged() { lock.withLock { signals += 1 } }
+		var count: Int { lock.withLock { signals } }
+	}
+
+	/// The bridge, as far as it can be driven without the server endpoint: a file with a stake in
+	/// it becomes a tracked lineage, a change to that file made on the drive comes back through
+	/// the engine's socket rather than through anybody asking, and the listener is what says so.
+	///
+	/// Reconciliation is asked for twice on purpose — the second pass has nothing to add or drop
+	/// and must still succeed, because every membership-changing call makes the same request.
+	func testTrackingCarriesADriveChangeIntoTheWorkingSet() async throws {
+		let dir = try await makeIsolatedDir("tracking")
+		let file = try await state.createEmptyFile(
+			parentPath: dir.id, name: "tracked.txt", mime: "text/plain")
+		let identifier = "stable/\(file.file.stableUuid)"
+		// A favourite is a stake, and a stake is what puts the file under tracking.
+		_ = try await state.setFavoriteRank(item: identifier, favoriteRank: 1)
+
+		let signals = SignalCounter()
+		state.setWorkingSetListener(listener: signals)
+		try await state.refreshWorkingSetTracking()
+		try await state.refreshWorkingSetTracking()
+
+		// A drive change to the tracked file. Nothing here asks the cache about the item: the only
+		// path from the change to the signal is the socket, the file sync root, and the bridge.
+		//
+		// Repeated because the engine's socket connects asynchronously behind the registration,
+		// and an event that lands before it is up is never redelivered — healing that gap is the
+		// one part still waiting on `v3/file/stable`. Each pass is a real drive change, so the
+		// first one after the socket is up is delivered.
+		for attempt in 0..<10 where signals.count == 0 {
+			_ = try await state.setFavoriteRank(
+				item: identifier, favoriteRank: attempt % 2 == 0 ? 0 : 1)
+			let deadline = Date().addingTimeInterval(6)
+			while signals.count == 0 && Date() < deadline {
+				try await Task.sleep(nanoseconds: 250_000_000)
+			}
+		}
+		XCTAssertGreaterThan(
+			signals.count, 0,
+			"a change to a tracked file has to reach the replica without it having asked")
+
+		// Teardown drops the registrations, not the set: it is rebuilt from the database, so a
+		// refresh afterwards is a fresh start rather than an error. Stopped again at the end so
+		// the test leaves no tracking — and so no engine — running behind it.
+		state.stopWorkingSetTracking()
+		try await state.refreshWorkingSetTracking()
+		state.stopWorkingSetTracking()
+		state.setWorkingSetListener(listener: nil)
+	}
 }

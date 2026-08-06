@@ -117,6 +117,32 @@ final class InFlightWork: Sendable {
 	}
 }
 
+/// Passes the cache's "something in your working set moved" on to the system.
+///
+/// Tracking lands a change in the cache on its own schedule — nobody is waiting on a call when it
+/// happens — so this signal is the only way the system learns to come and ask for the diff.
+/// Best-effort by design: a failed signal costs freshness until the next enumeration, never
+/// correctness, so it is logged and dropped.
+final class WorkingSetSignaller: WorkingSetUpdateListener, @unchecked Sendable {
+	private static let logger = Logger(subsystem: PROVIDER, category: "FileProvider")
+	private let manager: NSFileProviderManager?
+
+	init(manager: NSFileProviderManager?) {
+		self.manager = manager
+	}
+
+	func workingSetChanged() {
+		guard let manager = self.manager else { return }
+		Task {
+			do {
+				try await manager.signalEnumerator(for: .workingSet)
+			} catch {
+				Self.logger.error("signalling the working set failed: \(error)")
+			}
+		}
+	}
+}
+
 final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	NSFileProviderThumbnailing
 {
@@ -349,6 +375,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
 		super.init()
 
+		// Registered before anything else asks the cache for work: from here on, a tracked file
+		// that changes on the drive reaches the system without the system having asked.
+		self.state.setWorkingSetListener(listener: WorkingSetSignaller(manager: manager))
+
 		// An edit whose upload failed stays marked in the cache, and nothing drains those markers
 		// on its own. This process is the only thing that reliably runs after a failure, so drain
 		// on the way up. Registered as in-flight work so a discarded instance lets go of it; a
@@ -371,6 +401,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
 	func invalidate() {
 		self.inFlight.cancelAll()
+		// The registrations belong to this instance's cache state; a discarded extension must not
+		// leave them holding a socket subscription. The next instance rebuilds the whole set from
+		// the database on its first refresh, so nothing is lost. The listener goes with them —
+		// its manager belongs to this instance too.
+		self.state.stopWorkingSetTracking()
+		self.state.setWorkingSetListener(listener: nil)
 	}
 
 	// MARK: - Reading items
