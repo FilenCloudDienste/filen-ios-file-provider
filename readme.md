@@ -25,10 +25,17 @@ will instantiate it — a replicated extension has no implicit default domain.
 
 ## Testing
 
-`FilenFileProviderTests` is a host-less unit test bundle covering what the extension itself cannot
-be run for: a replicated extension does not run in the simulator, so the enumerators, the item
-lookup, the modify dispatch and the cache FFI behind them are driven directly. It runs against the
+`FilenFileProviderTests` is a host-less unit test bundle driving the enumerators, the item lookup,
+the modify dispatch and the cache FFI directly, without the system in the loop. It runs against the
 live backend, so it needs the same test account as above.
+
+The extension itself does run in the simulator (verified on iOS 26.5): build and run the
+`FilenFileProvider` host app, flip its toggle, and it provisions the DEK, seals an auth.json,
+registers the `io.filen.drive` domain and lists the drive root through a coordinated read. Pass
+`-harness-enable` / `-harness-disable` as launch arguments to drive the same paths from a script.
+A freshly registered domain starts out disabled by the user (`Enabled = false` in the system's
+`Domains.plist`), and every request then fails with `NSFileProviderErrorDomainDisabled` (-2011)
+until the location is switched on in Files.app.
 
 ```sh
 ./run-tests.sh                                   # uses ./.env

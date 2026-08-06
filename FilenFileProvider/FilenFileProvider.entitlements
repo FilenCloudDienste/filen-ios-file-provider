@@ -6,5 +6,9 @@
 	<array>
 		<string>group.io.filen.app</string>
 	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>7YTW5D2K7P.io.filen.sharedkeys</string>
+	</array>
 </dict>
 </plist>
