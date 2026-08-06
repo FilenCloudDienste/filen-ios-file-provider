@@ -42,9 +42,13 @@ final class CallOnce: Sendable {
 /// cancels its task, and cancelling the extension does the same for all of them. Nothing here
 /// retains the extension: the task bodies capture what they need themselves.
 ///
-/// The UniFFI bindings have no cancellation hook — a Rust future cannot be cancelled from Swift —
-/// so cancelling only abandons the operation from this side: the upload, download or rename it
-/// started runs to completion against the server. That is deliberate and safe under v1's
+/// UniFFI has no cancellation hook — a Rust future cannot be cancelled from Swift — so the three
+/// calls that move bytes take an abort signal instead and give up on it in band. Handing `run` the
+/// controller is what wires that up: both cancellation paths trip it, so the transfer really stops
+/// rather than being abandoned while it keeps running against the server.
+///
+/// Everything else — the metadata calls, the working-set refresh — has no signal to hand in and
+/// still runs to completion when its call is cancelled. That is deliberate and safe under v1's
 /// server-wins policy: the change was already on disk, which is the state the drive is being caught
 /// up to, and an upload whose completion nobody is waiting for is still recorded by the cache's
 /// pending-upload marker, so the launch drain finishes the job if the process dies first.
@@ -54,15 +58,19 @@ final class InFlightWork: Sendable {
 		/// Answers the system's completion handler with `NSUserCancelledError`, through the same
 		/// `CallOnce` the task body answers through — so whichever happens first is the only one.
 		let cancel: @Sendable () -> Void
+		/// The Rust side of the same cancellation, for an operation that took a signal.
+		let abort: FfiAbortController?
 	}
 
 	private let running = OSAllocatedUnfairLock<[UUID: Work]>(initialState: [:])
 
 	/// Runs `body` as a task the system can cancel through `progress`, and hands `progress` back
-	/// so the caller can return it verbatim. `onCancel` answers the call being cancelled.
+	/// so the caller can return it verbatim. `onCancel` answers the call being cancelled, and
+	/// `abort` — the controller whose signal `body` handed to the cache — stops the Rust work.
 	@discardableResult
 	func run(
 		_ progress: Progress, onCancel: @escaping @Sendable () -> Void = {},
+		abort: FfiAbortController? = nil,
 		_ body: @escaping () async -> Void
 	) -> Progress {
 		let id = UUID()
@@ -74,11 +82,12 @@ final class InFlightWork: Sendable {
 				await body()
 				running.withLock { $0[id] = nil }
 			}
-			work[id] = Work(task: task, cancel: onCancel)
+			work[id] = Work(task: task, cancel: onCancel, abort: abort)
 			return task
 		}
 		progress.cancellationHandler = {
 			onCancel()
+			abort?.abort()
 			task.cancel()
 		}
 		return progress
@@ -102,6 +111,7 @@ final class InFlightWork: Sendable {
 			return all
 		}).values {
 			work.cancel()
+			work.abort?.abort()
 			work.task.cancel()
 		}
 	}
@@ -451,9 +461,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		let state = self.state
 		let progress = Progress()
 		let answer = CallOnce()
+		let abort = FfiAbortController()
 		return self.inFlight.run(
 			progress,
-			onCancel: { answer.fire { completionHandler(nil, nil, userCancelledError()) } }
+			onCancel: { answer.fire { completionHandler(nil, nil, userCancelledError()) } },
+			abort: abort
 		) { [weak self] in
 			do {
 				// A nil `self` is this instance being discarded mid-call, not a fact about the
@@ -465,7 +477,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 				let response = try await state.downloadFileIfChangedWithItem(
 					id: id,
 					progressCallback: ProgressNotifier(
-						set: Self.downloadingSet, id: itemIdentifier.rawValue, progress: progress))
+						set: Self.downloadingSet, id: itemIdentifier.rawValue, progress: progress),
+					abort: abort.signal())
 				let object = FfiObject.file(response.file)
 				// Known, accepted race: the download holds the item's per-file lock only for as
 				// long as it runs, so the lock is gone by the time this copy starts. A
@@ -516,7 +529,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		let abort = FfiAbortController()
 		return self.inFlight.run(
 			progress,
-			onCancel: { answer.fire { completionHandler(nil, [], false, userCancelledError()) } }
+			onCancel: { answer.fire { completionHandler(nil, [], false, userCancelledError()) } },
+			abort: abort
 		) { [weak self] in
 			do {
 				// Discarded mid-call. Transient, not an answer about the item.
@@ -755,9 +769,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	}
 
 	/// Runs one step and hands back what the item became.
+	///
+	/// `abort` is the only cancellable step's signal — the upload. The rest are single round trips
+	/// that answer or fail long before a cancellation could be acted on.
 	static func apply(
 		_ step: ModifyStep, state: FilenMobileCacheState, id: String, contents: URL?,
-		progress: Progress?
+		progress: Progress?, abort: FfiAbortSignal? = nil
 	) async throws -> FfiObject {
 		switch step {
 		case .contents:
@@ -772,7 +789,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 					uploaded = try await state.modifyFileContent(
 						id: id, osPath: contents.path(percentEncoded: false),
 						progressCallback: ProgressNotifier(
-							set: uploadingSet, id: id, progress: progress))
+							set: uploadingSet, id: id, progress: progress),
+						abort: abort)
 				},
 				onRetry: { attempt in
 					Self.logger.error("content upload attempt \(attempt) failed for \(id)")
@@ -819,9 +837,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		let state = self.state
 		let progress = Progress()
 		let answer = CallOnce()
+		let abort = FfiAbortController()
 		return self.inFlight.run(
 			progress,
-			onCancel: { answer.fire { completionHandler(nil, [], false, userCancelledError()) } }
+			onCancel: { answer.fire { completionHandler(nil, [], false, userCancelledError()) } },
+			abort: abort
 		) { [weak self] in
 			do {
 				// Discarded mid-call. Transient, not an answer about the item.
@@ -855,7 +875,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 				var object: FfiObject?
 				for step in steps {
 					object = try await Self.apply(
-						step, state: state, id: id, contents: newContents, progress: progress)
+						step, state: state, id: id, contents: newContents, progress: progress,
+						abort: abort.signal())
 				}
 
 				// Nothing to do (or nothing we handle): answer with the item as it stands, which
@@ -972,8 +993,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	///
 	/// A cancelled operation is not a failure and is never retried: the call it belongs to has
 	/// already been answered from the `Progress` cancellation handler, so a retry would upload the
-	/// file again for nobody. The check is at the top of the loop because the backoff swallows
-	/// cancellation (`try? await Task.sleep`) — this is where a loop cancelled mid-sleep stops.
+	/// file again for nobody. That covers both spellings a cancellation arrives in — a Swift
+	/// `CancellationError`, and `CacheError.Aborted`, which is the same cancellation coming back
+	/// out of the cache because the abort signal is how a Rust call is stopped. The check is at the
+	/// top of the loop because the backoff swallows cancellation (`try? await Task.sleep`) — this
+	/// is where a loop cancelled mid-sleep stops.
 	static func retrying(
 		attempts: Int,
 		operation: () async throws -> Void,
@@ -987,6 +1011,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 				return nil
 			} catch is CancellationError {
 				return CancellationError()
+			} catch CacheError.Aborted(let reason) {
+				return CacheError.Aborted(reason)
 			} catch {
 				lastError = error
 				if attempt < attempts { await onRetry(attempt) }

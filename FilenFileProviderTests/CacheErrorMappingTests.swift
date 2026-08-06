@@ -121,6 +121,17 @@ final class CacheErrorMappingTests: XCTestCase {
 		assertFileProviderError(.SyncAnchorExpired("wrong database"), .syncAnchorExpired)
 	}
 
+	/// An abort is the extension's own cancellation coming back out of the cache — uniffi cannot
+	/// cancel a Rust future, so the byte-moving calls take an abort signal instead. It must map to
+	/// the answer the framework asks a cancelled call for, not to a failure the user is shown or
+	/// the system retries.
+	func testAnAbortMapsToUserCancelled() {
+		assertCocoaError(.Aborted("the call was aborted"), NSUserCancelledError)
+		XCTAssertEqual(
+			mapped(.Aborted("x")), userCancelledError(),
+			"an abort must be answered exactly as the Progress cancellation handler answers")
+	}
+
 	// MARK: - Totality
 
 	/// Nothing may reach the system as a raw `CacheError`. If a binding regeneration adds a case,
@@ -130,7 +141,7 @@ final class CacheErrorMappingTests: XCTestCase {
 			.Sql("x"), .Sdk("x"), .Conversion("x"), .Io("x"), .Remote("x"), .Image("x"),
 			.Unauthenticated("x"), .Disabled("x"), .DoesNotExist("x"), .Unsupported("x"),
 			.NotADirectory("x"), .FailedToDecrypt("x"), .InvalidName("x"),
-			.SyncAnchorExpired("x"),
+			.SyncAnchorExpired("x"), .Aborted("x"),
 		]
 
 		for error in everyCase {

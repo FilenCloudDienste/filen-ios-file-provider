@@ -82,6 +82,23 @@ final class RetryTests: XCTestCase {
 		XCTAssertTrue(failure is CancellationError)
 	}
 
+	/// The same cancellation in its other spelling: uniffi cannot cancel a Rust future, so a
+	/// cancelled upload comes back as `CacheError.Aborted` rather than as a `CancellationError`.
+	/// Retrying it would send the file again for a call the cancellation handler already answered
+	/// — and the retry would abort at once anyway, since the signal stays tripped.
+	func testAnAbortedOperationIsNotRetried() async {
+		var calls = 0
+		let failure = await FileProviderExtension.retrying(attempts: 3) {
+			calls += 1
+			throw CacheError.Aborted("the call was aborted")
+		}
+
+		XCTAssertEqual(calls, 1, "an abort is the cancel, not a failure to recover from")
+		guard case .Aborted? = failure as? CacheError else {
+			return XCTFail("the abort must be reported as itself: \(String(describing: failure))")
+		}
+	}
+
 	/// ...and a loop running in a cancelled task stops instead of grinding through its attempts.
 	/// The backoff swallows cancellation (`try? await Task.sleep`), so without the check at the top
 	/// of the loop a cancelled retry would run every remaining attempt back to back.

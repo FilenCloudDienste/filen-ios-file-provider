@@ -102,9 +102,10 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 	}
 
 	/// The diff, served on the extension's registry so `invalidate()` can drop it: an observer
-	/// belonging to a discarded instance must not be called afterwards. The refresh below is a Rust
-	/// future with no cancellation hook, so cancelling only abandons it — it finishes against the
-	/// server, and the answer it would have given is dropped by the guard.
+	/// belonging to a discarded instance must not be called afterwards. The refresh below takes no
+	/// abort signal — only the three byte-moving calls do — so cancelling only abandons it: it
+	/// finishes against the server, and the answer it would have given is dropped by the guard.
+	/// That is one metadata round trip, not a transfer, which is why it is not worth stopping.
 	func enumerateChanges(
 		for observer: any NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor
 	) {

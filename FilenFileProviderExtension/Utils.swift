@@ -85,6 +85,13 @@ func cacheErrorToError(error: CacheError) -> any Error {
 	// an anchor was handed to a call that has no re-enumeration to fall back on.
 	case .SyncAnchorExpired:
 		return NSFileProviderError(.syncAnchorExpired)
+	// Not a failure either: this is the caller's own cancellation coming back in band, because
+	// uniffi cannot cancel a Rust future and the calls that move bytes take an abort signal
+	// instead. It spells the same answer the `Progress` cancellation handler already fired — which
+	// is usually why the call was aborted at all, so the completion guard has normally spent it
+	// before this mapping is reached.
+	case .Aborted:
+		return userCancelledError()
 	// Content this build cannot read: not a blip, and retrying the same bytes with the same keys
 	// produces the same failure. This is what `.cannotSynchronize` describes — "syncing that item
 	// is definitively broken" until "the FileProvider extension has been updated [or] the item is
