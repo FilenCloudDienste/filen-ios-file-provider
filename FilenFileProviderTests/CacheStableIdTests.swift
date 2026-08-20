@@ -6,7 +6,7 @@ import XCTest
 /// These cover the exact cache calls the file provider depends on for identity:
 ///  - `stable/<id>` addressing files and directories across renames and moves
 ///  - `queryPathForUuid`, which resolves a stable id back to a name path
-///  - `queryItemByUuid`, which `persistentIdentifierForItem(at:)` uses to recover an identifier
+///  - `queryItemByUuid`, which recovers an item from a uuid a provider still holds
 ///
 /// Requirements to run: the session env vars listed in `TestAuth.requiredVariables`. Without them
 /// every test skips rather than fails, so an unconfigured checkout stays green.
@@ -180,51 +180,53 @@ final class CacheStableIdTests: XCTestCase {
 			"expected a name path ending in the file name, got \(path)")
 	}
 
-	/// A move followed by a failing rename must not leave the item moved.
-	///
-	/// The two steps are separate server calls with no transaction. Previously the move committed
-	/// and then a failing rename threw, telling the system the whole operation failed while the
-	/// item had in fact moved — so the Files app showed it in its old folder while the server had
-	/// it in the new one, and the divergence persisted until something forced a re-listing.
-	func testAFailedRenameDoesNotLeaveTheItemMoved() async throws {
+	/// A move and a rename arrive together and are two server calls, so the move can land and the
+	/// rename fail. The replicated model asks for no compensation: the change is already on disk,
+	/// which is the truth the provider is catching up to, and undoing the move server-side would
+	/// push a spurious move back down. The system retries the whole modification instead, and the
+	/// move it replays is a no-op.
+	func testAMoveSurvivesAFailingRename() async throws {
 		let root = try await makeIsolatedDir("stable-reparent")
 		let from = try await state.createDir(parentPath: root.id, name: "from", created: nil)
 		let to = try await state.createDir(parentPath: root.id, name: "to", created: nil)
 		let created = try await state.createEmptyFile(
 			parentPath: from.id, name: "movable.txt", mime: "text/plain")
-		let stableId = NSFileProviderItemIdentifier("stable/\(created.file.stableUuid)")
+		let stableId = "stable/\(created.file.stableUuid)"
 
+		_ = try await FileProviderExtension.apply(
+			.move(to: to.id), state: state, id: stableId, contents: nil, progress: nil)
 		// "/" is rejected as a filename, so the rename fails deterministically after the move.
 		do {
-			_ = try await FileProviderExtension.reparent(
-				state: state, itemIdentifier: stableId, newParent: to.id, newName: "bad/name",
-				parentItemIdentifier: NSFileProviderItemIdentifier(to.id))
+			_ = try await FileProviderExtension.apply(
+				.rename("bad/name"), state: state, id: stableId, contents: nil, progress: nil)
 			XCTFail("a rename to an invalid name should not succeed")
 		} catch {
 			// expected
 		}
 
-		let after = try XCTUnwrap(state.queryItem(path: stableId.rawValue))
+		let after = try XCTUnwrap(state.queryItem(path: stableId))
 		XCTAssertEqual(
-			objectToContainerUuid(object: after), from.dir.uuid,
-			"a failed rename must roll the move back, so the reported failure is truthful")
+			objectToContainerUuid(object: after), to.dir.uuid,
+			"the move stands; the rename is what the system retries")
+		XCTAssertEqual(name(of: after), "movable.txt", "and the failed rename changed nothing")
 	}
 
-	/// The successful path still moves and renames in one call.
-	func testAReparentWithARenameMovesAndRenames() async throws {
+	/// The steps a reparent-with-rename dispatches to, run in order, land both changes.
+	func testAMoveFollowedByARenameMovesAndRenames() async throws {
 		let root = try await makeIsolatedDir("stable-reparent-ok")
 		let from = try await state.createDir(parentPath: root.id, name: "from", created: nil)
 		let to = try await state.createDir(parentPath: root.id, name: "to", created: nil)
 		let created = try await state.createEmptyFile(
 			parentPath: from.id, name: "before.txt", mime: "text/plain")
-		let stableId = NSFileProviderItemIdentifier("stable/\(created.file.stableUuid)")
+		let stableId = "stable/\(created.file.stableUuid)"
 
-		let item = try await FileProviderExtension.reparent(
-			state: state, itemIdentifier: stableId, newParent: to.id, newName: "after.txt",
-			parentItemIdentifier: NSFileProviderItemIdentifier(to.id))
+		_ = try await FileProviderExtension.apply(
+			.move(to: to.id), state: state, id: stableId, contents: nil, progress: nil)
+		let renamed = try await FileProviderExtension.apply(
+			.rename("after.txt"), state: state, id: stableId, contents: nil, progress: nil)
 
-		XCTAssertEqual(item.filename, "after.txt")
-		let after = try XCTUnwrap(state.queryItem(path: stableId.rawValue))
+		XCTAssertEqual(name(of: renamed), "after.txt")
+		let after = try XCTUnwrap(state.queryItem(path: stableId))
 		XCTAssertEqual(objectToContainerUuid(object: after), to.dir.uuid)
 	}
 
@@ -254,24 +256,18 @@ final class CacheStableIdTests: XCTestCase {
 		XCTAssertNotEqual(container, .rootContainer, "and never to the drive root")
 	}
 
-	/// The working set is NOT a resolvable cache id, which is why enumerating it cannot work today.
+	/// The working set is NOT a resolvable cache id, and never will be: it is a set the cache
+	/// computes (`queryWorkingSet`), not a container it holds a row for. The sentinel is not even
+	/// a syntactically valid id, so a lookup throws a conversion error before any query happens.
 	///
-	/// `enumerator(for:)` builds an enumerator for any container, but `FileProviderEnumerator`'s
-	/// init only substitutes a cache-form id for `.rootContainer` and `.trashContainer`
-	/// (FileProviderEnumerator.swift:17-21). `.workingSet`'s opaque sentinel therefore goes straight
-	/// into `queryItem(path:)` and can only miss — and `enumerateChanges(for:from:)` is not
-	/// implemented at all. So `itemChanged`'s failure-path `signalEnumerator(for: .workingSet)`
-	/// retriggers an enumeration guaranteed to fail: the retry is a dead end.
-	///
-	/// This pins the mechanism. Making the working set real (routing it to a materialized-items
-	/// query and implementing `enumerateChanges`) is a feature, sized separately — when it lands,
-	/// this test should flip to asserting the working set resolves.
-	/// It does not merely miss — the sentinel is not even a syntactically valid id, so the lookup
-	/// throws a conversion error before any query happens.
+	/// This is exactly why `enumerator(for:)` has to route `.workingSet` to its own enumerator
+	/// rather than through the generic container path — which substitutes a cache-form id only for
+	/// `.rootContainer` and `.trashContainer` and would hand this sentinel straight to
+	/// `queryItem(path:)`.
 	func testTheWorkingSetSentinelIsNotAResolvableCacheId() {
 		XCTAssertThrowsError(
 			try state.queryItem(path: NSFileProviderItemIdentifier.workingSet.rawValue),
-			"known gap: the working set is not addressable, so signalling it cannot drive a retry"
+			"the working set is computed, not addressable — it needs its own enumerator"
 		) { error in
 			XCTAssertTrue(
 				error is CacheError,
@@ -279,8 +275,26 @@ final class CacheStableIdTests: XCTestCase {
 		}
 	}
 
-	/// `queryItemByUuid` is what the iOS extension's `persistentIdentifierForItem(at:)` calls to
-	/// recover an identifier from a URL. It must return the row carrying the stable identity.
+	/// ...and because it is not resolvable, an item lookup for it must be refused explicitly. Left
+	/// to fall through it reads as a cache miss, and a miss answers `.noSuchItem` — which the
+	/// system acts on by deleting the item from disk.
+	func testLookingUpTheWorkingSetIsNotAnItemMiss() async {
+		do {
+			_ = try await FileProviderExtension.resolveItem(
+				state: state, identifier: .workingSet, rootUuid: rootUuid)
+			XCTFail("the working set is not an item and must not resolve to one")
+		} catch {
+			let nsError = error as NSError
+			XCTAssertFalse(
+				nsError.domain == NSFileProviderErrorDomain
+					&& nsError.code == NSFileProviderError.noSuchItem.rawValue,
+				"noSuchItem would have the system delete the working set from disk")
+			XCTAssertEqual(nsError.domain, NSCocoaErrorDomain, "and it must stay retryable")
+		}
+	}
+
+	/// `queryItemByUuid` recovers an item from a uuid a provider still holds — a superseded one
+	/// included. It must return the row carrying the stable identity.
 	func testQueryItemByUuidReturnsTheStableIdentity() async throws {
 		let dir = try await makeIsolatedDir("stable-byuuid")
 		let created = try await state.createEmptyFile(

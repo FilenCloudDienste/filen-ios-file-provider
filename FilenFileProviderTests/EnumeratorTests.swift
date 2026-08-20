@@ -222,11 +222,9 @@ final class EnumeratorTests: XCTestCase {
 
 	// MARK: - C3: paging contract
 
-	/// Paging is deliberately not implemented: `enumerateItems` ignores the page and always calls
-	/// `finishEnumerating(upTo: nil)`, meaning one full batch and no continuation.
-	///
-	/// This pins that contract. If partial paging is ever introduced, passing a non-initial page
-	/// must not silently drop items — this test would catch a half-migrated implementation.
+	/// Both of the system's initial pages start the enumeration from the beginning, so a
+	/// directory smaller than one page comes back whole either way. This pins that the sort the
+	/// system asks for never costs items.
 	func testEveryChildIsDeliveredInASingleBatchRegardlessOfPage() async throws {
 		let parent = try await state.createDir(
 			parentPath: rootUuid, name: "enum-\(UUID().uuidString)", created: nil)
@@ -251,6 +249,27 @@ final class EnumeratorTests: XCTestCase {
 			page: NSFileProviderPage(NSFileProviderPage.initialPageSortedByDate as Data))
 		XCTAssertEqual(
 			byDate.enumerated.count, childCount,
-			"enumeration ignores the page and always returns everything")
+			"both initial pages start from the beginning and return everything")
+	}
+
+	// MARK: - C4: no incremental tracking per directory
+
+	/// A directory enumerator answers with no sync anchor on purpose: the drive has no
+	/// per-container change history to diff against, and the system re-enumerates the container
+	/// when it is presented instead. Handing out an anchor we cannot honour would be worse than
+	/// none — the system would trust a diff that silently misses items moved out of the folder.
+	func testADirectoryHasNoSyncAnchor() throws {
+		let enumerator = FileProviderEnumerator(
+			enumeratedItemIdentifier: .rootContainer, state: state, rootUuid: rootUuid)
+
+		var anchor: NSFileProviderSyncAnchor? = NSFileProviderSyncAnchor(Data())
+		let read = expectation(description: "anchor read")
+		enumerator.currentSyncAnchor { value in
+			anchor = value
+			read.fulfill()
+		}
+		wait(for: [read], timeout: 30)
+
+		XCTAssertNil(anchor, "a directory enumerator must not claim an anchor it cannot honour")
 	}
 }

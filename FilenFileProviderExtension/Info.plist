@@ -4,8 +4,6 @@
 <dict>
 	<key>AppGroup</key>
 	<string>group.io.filen.app</string>
-	<key>NSExtensionFileProviderDocumentGroup</key>
-	<string>group.io.filen.app</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundleDisplayName</key>
@@ -22,8 +20,6 @@
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>NSExtension</key>
 	<dict>
-		<key>NSExtensionFileProviderDocumentGroup</key>
-		<string>group.io.filen.app</string>
 		<key>NSExtensionFileProviderSupportsEnumeration</key>
 		<true/>
 		<key>NSExtensionFileProviderSupportsPickingFolders</key>

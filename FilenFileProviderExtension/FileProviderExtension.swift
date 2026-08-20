@@ -5,7 +5,6 @@ import UniformTypeIdentifiers
 import os
 
 let PROVIDER = "app.filen.io"
-let BACKGROUND_ID = PROVIDER + ".background"
 
 // auth.json DEK keychain item — these MUST match the app side (fileProvider.ts via expo-secure-store).
 // The team-prefixed access group is what lets the app and this extension share the item; the app group
@@ -16,19 +15,117 @@ let AUTH_DEK_ACCESS_GROUP = "7YTW5D2K7P.io.filen.sharedkeys"
 let AUTH_DEK_SERVICE = "io.filen.fileprovider"
 let AUTH_DEK_ACCOUNT = "fileProviderAuthKey"
 
-class FileProviderExtension: NSFileProviderExtension {
+/// Runs the first block handed to it and drops every later one.
+///
+/// Each File Provider call must answer its completion handler exactly once, and two paths race to
+/// do it: the task body, and the `Progress` cancellation handler, which the framework requires to
+/// answer the call itself ("If the NSProgress returned by this method is cancelled, the extension
+/// should call the completion handler with (... NSUserCancelledError) in the NSProgress
+/// cancellation handler." — NSFileProviderReplicatedExtension.h). Whichever gets here first wins.
+final class CallOnce: Sendable {
+	private let spent = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+	func fire(_ body: () -> Void) {
+		let alreadySpent = self.spent.withLock { spent -> Bool in
+			if spent { return true }
+			spent = true
+			return false
+		}
+		guard !alreadySpent else { return }
+		body()
+	}
+}
+
+/// The work the system is waiting on, so `invalidate()` can drop it.
+///
+/// Every call the framework makes hands back a `Progress`; cancelling it answers that one call and
+/// cancels its task, and cancelling the extension does the same for all of them. Nothing here
+/// retains the extension: the task bodies capture what they need themselves.
+///
+/// The UniFFI bindings have no cancellation hook — a Rust future cannot be cancelled from Swift —
+/// so cancelling only abandons the operation from this side: the upload, download or rename it
+/// started runs to completion against the server. That is deliberate and safe under v1's
+/// server-wins policy: the change was already on disk, which is the state the drive is being caught
+/// up to, and an upload whose completion nobody is waiting for is still recorded by the cache's
+/// pending-upload marker, so the launch drain finishes the job if the process dies first.
+final class InFlightWork: Sendable {
+	private struct Work: Sendable {
+		let task: Task<Void, Never>
+		/// Answers the system's completion handler with `NSUserCancelledError`, through the same
+		/// `CallOnce` the task body answers through — so whichever happens first is the only one.
+		let cancel: @Sendable () -> Void
+	}
+
+	private let running = OSAllocatedUnfairLock<[UUID: Work]>(initialState: [:])
+
+	/// Runs `body` as a task the system can cancel through `progress`, and hands `progress` back
+	/// so the caller can return it verbatim. `onCancel` answers the call being cancelled.
+	@discardableResult
+	func run(
+		_ progress: Progress, onCancel: @escaping @Sendable () -> Void = {},
+		_ body: @escaping () async -> Void
+	) -> Progress {
+		let id = UUID()
+		let running = self.running
+		// Registered under the lock rather than after starting the task: a task that finished
+		// before the insert landed would leave its own entry behind forever.
+		let task = running.withLock { work -> Task<Void, Never> in
+			let task = Task {
+				await body()
+				running.withLock { $0[id] = nil }
+			}
+			work[id] = Work(task: task, cancel: onCancel)
+			return task
+		}
+		progress.cancellationHandler = {
+			onCancel()
+			task.cancel()
+		}
+		return progress
+	}
+
+	/// Registers work this class does not drive — a call whose completion arrives through a
+	/// callback rather than an `async` body, which `run` cannot model. `cancel` runs on
+	/// `cancelAll` exactly as a task's would; the returned closure deregisters it and MUST be
+	/// called when the work finishes, or the entry outlives it.
+	func register(cancel: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
+		let id = UUID()
+		let running = self.running
+		running.withLock { $0[id] = Work(task: Task {}, cancel: cancel, abort: nil) }
+		return { running.withLock { $0[id] = nil } }
+	}
+
+	func cancelAll() {
+		for work in running.withLock({ work in
+			let all = work
+			work = [:]
+			return all
+		}).values {
+			work.cancel()
+			work.task.cancel()
+		}
+	}
+}
+
+final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
+	NSFileProviderThumbnailing
+{
 	private static let logger = Logger(subsystem: PROVIDER, category: "FileProvider")
 	let state: FilenMobileCacheState
-	// Lazily cached, and the system invokes the overrides below concurrently — so this needs the
+	/// The domain's own manager. It owns the temporary directory downloaded content is staged
+	/// through, which has to be on the same volume as the replica for the system to clone from it.
+	private let manager: NSFileProviderManager?
+	// Lazily cached, and the system invokes the methods below concurrently — so this needs the
 	// same locking as the two sets underneath it, not a bare var.
 	private let cachedRootUuid = OSAllocatedUnfairLock<String?>(initialState: nil)
-	/// Attempts for an `itemChanged` upload before the edit is given up on. Three with exponential
+	private let inFlight = InFlightWork()
+	/// Attempts for a content upload before the edit is given up on. Three with exponential
 	/// backoff covers a transient blip without keeping a suspended-at-any-moment extension busy.
 	static let uploadAttempts = 3
 	public static var uploadingSet = TransfersInFlight(initialState: [:])
 	public static var downloadingSet = TransfersInFlight(initialState: [:])
 
-	// MARK: - Working with items and persistent identifiers
+	// MARK: - Identity
 
 	func getRootUuid() throws -> String {
 		if let cached = self.cachedRootUuid.withLock({ $0 }) { return cached }
@@ -38,6 +135,64 @@ class FileProviderExtension: NSFileProviderExtension {
 		self.cachedRootUuid.withLock { $0 = uuid }
 		return uuid
 	}
+
+	/// The cache id an identifier names. The system's two container sentinels have cache forms of
+	/// their own; every other identifier this provider issues is already one (`stable/<id>`).
+	static func cacheId(for identifier: NSFileProviderItemIdentifier, rootUuid: String) -> String {
+		switch identifier {
+		case .rootContainer: return rootUuid
+		case .trashContainer: return TRASH_CACHE_ID
+		default: return identifier.rawValue
+		}
+	}
+
+	/// The identifier handed to the system for an object: the whole-life
+	/// stable id for files and directories (identifiers must not change when
+	/// an item is edited, moved, or renamed), `fallback` for the root.
+	/// Static because this is the single place deciding that files key off their stable id and
+	/// directories off their uuid — the whole-life-identity invariant. Keeping it free of `self`
+	/// makes it directly testable.
+	static func itemIdentifier(for object: FfiObject, fallback: String)
+		-> NSFileProviderItemIdentifier
+	{
+		switch object {
+		case .file(let ffiFile):
+			return NSFileProviderItemIdentifier("stable/" + ffiFile.stableUuid)
+		case .dir(let ffiDir):
+			// dirs have no stable id on the wire, by design: stable == uuid
+			return NSFileProviderItemIdentifier("stable/" + ffiDir.uuid)
+		case .root(_): return NSFileProviderItemIdentifier(fallback)
+		}
+	}
+
+	/// The identifier of the container an object lives in (the original parent
+	/// while trashed — the system ignores the parent of a trashed item and reads
+	/// `isTrashed` instead). Containers are directories, whose stable id IS their
+	/// uuid, so no cache lookup is needed. Falls back to path-splitting the
+	/// item's own identifier, which preserves the legacy behavior for path ids.
+	///
+	/// `rootUuid` is passed in rather than read from `self` so the mapping is testable; nil simply
+	/// means the root is unknown, in which case no identifier can be the root container.
+	static func containerIdentifier(
+		for object: FfiObject, fallbackFrom identifier: NSFileProviderItemIdentifier,
+		rootUuid: String?
+	) -> NSFileProviderItemIdentifier {
+		guard let parentUuid = objectToContainerUuid(object: object) else {
+			return getParentItemIdentifier(itemIdentifier: identifier)
+		}
+		if parentUuid == rootUuid { return .rootContainer }
+		return NSFileProviderItemIdentifier("stable/" + parentUuid)
+	}
+
+	/// Instance convenience supplying the cached root uuid.
+	func containerIdentifier(
+		for object: FfiObject, fallbackFrom identifier: NSFileProviderItemIdentifier
+	) -> NSFileProviderItemIdentifier {
+		Self.containerIdentifier(
+			for: object, fallbackFrom: identifier, rootUuid: try? self.getRootUuid())
+	}
+
+	// MARK: - Lifecycle
 
 	// Reads the 32-byte auth.json DEK from the shared Keychain access group. The app stores it
 	// base64-encoded via expo-secure-store; decode it back to raw bytes for the Rust cache. On any
@@ -119,7 +274,9 @@ class FileProviderExtension: NSFileProviderExtension {
 		return Data()
 	}
 
-	override init() {
+	required init(domain: NSFileProviderDomain) {
+		let manager = NSFileProviderManager(for: domain)
+		self.manager = manager
 		let authFile =
 			FileManager.default.containerURL(
 				forSecurityApplicationGroupIdentifier: "group.io.filen.app")?.appending(
@@ -129,34 +286,72 @@ class FileProviderExtension: NSFileProviderExtension {
 		// EXTENSION'S private container, not in documentStorage: documentStorage sits inside
 		// the shared app-group container, and iOS kills a process that is suspended while
 		// holding a file/SQLite lock there (RUNNINGBOARD 0xdead10cc) — both DBs are WAL, which
-		// holds a lock even while idle. Content files stay under documentStorage. DB files an
-		// earlier build left there are deliberately abandoned (nothing opens those paths again);
-		// the fresh location reinitializes and re-syncs the cache once. Failure to create the
-		// dir here is non-fatal by design — the Rust side create_dir_all's it again.
-		var dbDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+		// holds a lock even while idle. Content files stay under the app group. DB files an
+		// earlier build left elsewhere are deliberately abandoned (nothing opens those paths
+		// again); the fresh location reinitializes and re-syncs the cache once. Failure to
+		// create the dir here is non-fatal by design — the Rust side create_dir_all's it again.
+		//
+		// Keyed BY DOMAIN: every domain instance the process hosts gets its own database. With a
+		// shared path, two instances (e.g. the legacy default-domain instance the removed
+		// NSExtensionFileProviderDocumentGroup plist key used to invite) raced init_db's
+		// unlink-and-recreate against each other's live WAL connection at construction — and one
+		// instance's unauthenticated cleanup could delete the other's live database.
+		let legacyDbDir = FileManager.default.urls(
+			for: .applicationSupportDirectory, in: .userDomainMask)[0]
 			.appending(component: "database")
+		var dbDir = legacyDbDir.appending(component: domain.identifier.rawValue)
 		try? FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+		// One-time cleanup: builds before the per-domain split kept the database directly under
+		// database/, OUTSIDE the (per-domain) logout wipe's reach — and a leftover -wal carries
+		// the most recent decrypted names, which must not outlive a logout. Best-effort; gone
+		// means done.
+		for legacyFile in [
+			"native_cache.db", "native_cache.db-wal", "native_cache.db-shm", "db_state.json",
+			"sdk_search_cache.db", "sdk_search_cache.db-wal", "sdk_search_cache.db-shm",
+		] {
+			try? FileManager.default.removeItem(at: legacyDbDir.appending(component: legacyFile))
+		}
 		// Re-syncable cache, wiped on logout — keep it out of iCloud/local backups (a restored
 		// stale DB would just fail auth decryption and be wiped anyway).
 		var backupValues = URLResourceValues()
 		backupValues.isExcludedFromBackup = true
 		try? dbDir.setResourceValues(backupValues)
+		// The download cache keeps living in the app group, where the app can reach it too — at
+		// the exact path the legacy NSExtensionFileProviderDocumentGroup key used to derive
+		// (documentStorage = <group container>/File Provider Storage), so existing content
+		// caches survive; spelled explicitly because that plist key is gone (see the dbDir
+		// comment above for why it had to go). It is this provider's own storage, not what the
+		// system serves from: a replicated extension hands content to the system by staging a
+		// copy (see `stagedContents`).
+		let groupContainer = FileManager.default.containerURL(
+			forSecurityApplicationGroupIdentifier: "group.io.filen.app")
+		if groupContainer == nil {
+			Self.logger.error("app group container unavailable; content cache falls back to tmp")
+		}
+		let filesDir =
+			groupContainer?.appending(component: "File Provider Storage")
+			?? FileManager.default.temporaryDirectory.appending(component: "File Provider Storage")
 		self.state = FilenMobileCacheState.newWithDbDir(
-			filesDir: NSFileProviderManager.default.documentStorageURL.path(percentEncoded: false),
+			filesDir: filesDir.path(percentEncoded: false),
 			dbDir: dbDir.path(percentEncoded: false),
 			authFile: authFile,
 			dek: Self.loadAuthDek())
 
+		super.init()
+
 		// An edit whose upload failed stays marked in the cache, and nothing drains those markers
-		// on its own — the system calls `itemChanged` once and never again. This process is the
-		// only thing that reliably runs after a failure, so drain on the way up. Detached and
-		// unawaited: a slow drain must not delay the first operation the system asks for.
+		// on its own. This process is the only thing that reliably runs after a failure, so drain
+		// on the way up. Registered as in-flight work so a discarded instance lets go of it; a
+		// slow drain must not delay the first operation the system asks for, hence no await.
 		let state = self.state
-		Task.detached(priority: .utility) {
+		self.inFlight.run(Progress()) {
 			do {
 				let uploaded = try await state.retryPendingUploads()
 				if uploaded > 0 {
 					Self.logger.info("Recovered \(uploaded) pending upload(s) on launch")
+					// The recovered versions are new to the system: the working set is how a
+					// replicated provider says so.
+					try await manager?.signalEnumerator(for: .workingSet)
 				}
 			} catch {
 				Self.logger.error("Draining pending uploads failed: \(error)")
@@ -164,166 +359,621 @@ class FileProviderExtension: NSFileProviderExtension {
 		}
 	}
 
-	/// The identifier handed to the system for an object: the whole-life
-	/// stable id for files and directories (identifiers must not change when
-	/// an item is edited, moved, or renamed), `fallback` for the root.
-	/// Static because this is the single place deciding that files key off their stable id and
-	/// directories off their uuid — the whole-life-identity invariant. Keeping it free of `self`
-	/// makes it directly testable.
-	static func itemIdentifier(for object: FfiObject, fallback: String)
-		-> NSFileProviderItemIdentifier
-	{
-		switch object {
-		case .file(let ffiFile):
-			return NSFileProviderItemIdentifier("stable/" + ffiFile.stableUuid)
-		case .dir(let ffiDir):
-			// dirs have no stable id on the wire, by design: stable == uuid
-			return NSFileProviderItemIdentifier("stable/" + ffiDir.uuid)
-		case .root(_): return NSFileProviderItemIdentifier(fallback)
-		}
+	func invalidate() {
+		self.inFlight.cancelAll()
 	}
 
-	/// The identifier of the container an object lives in (the original parent
-	/// while trashed). Containers are directories, whose stable id IS their
-	/// uuid, so no cache lookup is needed. Falls back to path-splitting the
-	/// item's own identifier, which preserves the legacy behavior for path ids.
+	// MARK: - Reading items
+
+	/// The item an identifier names: the cache first, the server only when the cache has never
+	/// heard of it.
 	///
-	/// `rootUuid` is passed in rather than read from `self` so the mapping is testable; nil simply
-	/// means the root is unknown, in which case no identifier can be the root container.
-	static func containerIdentifier(
-		for object: FfiObject, fallbackFrom identifier: NSFileProviderItemIdentifier,
-		rootUuid: String?
-	) -> NSFileProviderItemIdentifier {
-		guard let parentUuid = objectToContainerUuid(object: object) else {
-			return getParentItemIdentifier(itemIdentifier: identifier)
+	/// Static, and taking `state`, so it is testable without a FileProviderExtension — which
+	/// cannot be constructed outside the extension process.
+	static func resolveItem(
+		state: FilenMobileCacheState, identifier: NSFileProviderItemIdentifier, rootUuid: String
+	) async throws -> NSFileProviderItem {
+		// The trash is a container the cache has no row for — it is reachable only through the
+		// dedicated trash API — so the system's view of it is synthesized here.
+		if identifier == .trashContainer { return TrashContainerItem() }
+		// The working set is computed, not held: the sentinel is not even a resolvable cache id
+		// (CacheStableIdTests.testTheWorkingSetSentinelIsNotAResolvableCacheId pins that the cache
+		// rejects it outright). Left to fall through it reads as a miss, and a miss answers
+		// `.noSuchItem` — which for the working set means "the item has been removed from the
+		// domain and [the system] will attempt to delete it from disk"
+		// (NSFileProviderReplicatedExtension.h). A transient failure is the honest answer: there is
+		// nothing to look up, and a retry costs nothing.
+		if identifier == .workingSet {
+			throw transientError("the working set is a computed set, not an item")
 		}
-		if parentUuid == rootUuid { return .rootContainer }
-		return NSFileProviderItemIdentifier("stable/" + parentUuid)
-	}
 
-	/// Instance convenience supplying the cached root uuid.
-	func containerIdentifier(
-		for object: FfiObject, fallbackFrom identifier: NSFileProviderItemIdentifier
-	) -> NSFileProviderItemIdentifier {
-		Self.containerIdentifier(
-			for: object, fallbackFrom: identifier, rootUuid: try? self.getRootUuid())
-	}
-
-	override func persistentIdentifierForItem(at url: URL) -> NSFileProviderItemIdentifier? {
-		guard let uuid = uuidFromCacheItemURL(url) else {
-			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
-			return nil
-		}
+		let id = cacheId(for: identifier, rootUuid: rootUuid)
+		var object: FfiObject?
 		do {
-			// items persist under their stable id; the uuid lookup below also
-			// resolves a superseded uuid left in a stale URL
-			if let object = try self.state.queryItemByUuid(uuid: uuid) {
-				switch object {
-				case .file(_), .dir(_):
-					return Self.itemIdentifier(for: object, fallback: uuid)
-				case .root(_): break
-				}
-			}
-			guard let path = try self.state.queryPathForUuid(uuid: uuid) else {
-				Self.logger.error("no path for uuid \(uuid)")
-				return nil
-			}
-			let id = NSFileProviderItemIdentifier(rawValue: path)
-			return id
-		} catch {
-			Self.logger.error("error getting path for uuid \(uuid): \(error)")
-			return nil
+			object = try state.queryItem(path: id)
+		} catch CacheError.DoesNotExist(_) {
+			// An id naming no local row is a miss, not a failure: the server may still have it.
+			object = nil
 		}
-	}
+		if object == nil { object = try await state.updateAndQueryItem(id: id) }
 
-	override func urlForItem(withPersistentIdentifier identifier: NSFileProviderItemIdentifier)
-		-> URL?
-	{
-		let object: FfiObject?
-
-		do { object = try self.objectForId(identifier: identifier) } catch {
-			Self.logger.error("error getting url for \(identifier.rawValue): \(error)")
-			return nil
-		}
-		guard let object = object else {
-			Self.logger.error("no url for item \(identifier.rawValue)")
-			return nil
-		}
-		switch object {
-		case .file(let item):
-			return NSFileProviderManager.default.documentStorageURL.appending(
-				path: "cache", directoryHint: .isDirectory
-			).appending(path: item.uuid, directoryHint: .isDirectory).appending(
-				component: item.meta?.name ?? item.uuid, directoryHint: .notDirectory)
-		case .dir(let item):
-			return NSFileProviderManager.default.documentStorageURL.appending(
-				path: "cache", directoryHint: .isDirectory
-			).appending(path: item.uuid, directoryHint: .isDirectory).appending(
-				component: item.meta?.name ?? item.uuid, directoryHint: .isDirectory)
-		case .root(let item):
-			return NSFileProviderManager.default.documentStorageURL.appending(
-				path: "cache", directoryHint: .isDirectory
-			).appending(path: item.uuid, directoryHint: .isDirectory).appending(
-				component: "root", directoryHint: .isDirectory)
-		}
-	}
-
-	override func item(for identifier: NSFileProviderItemIdentifier) throws -> NSFileProviderItem {
-		let object: FfiObject?
-		do { object = try self.objectForId(identifier: identifier) } catch let cacheError
-			as CacheError
-		{ throw cacheErrorToError(error: cacheError) }
-		guard let object = object else { throw NSFileProviderError(.noSuchItem) }
+		guard let object else { throw NSFileProviderError(.noSuchItem) }
 		return FileProviderItem(
 			itemIdentifier: identifier, object: object,
-			parentItemIdentifier: self.containerIdentifier(for: object, fallbackFrom: identifier))
+			parentItemIdentifier: containerIdentifier(
+				for: object, fallbackFrom: identifier, rootUuid: rootUuid))
 	}
 
-	override func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier) throws
-		-> NSFileProviderEnumerator
+	func item(
+		for identifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest,
+		completionHandler: @escaping (NSFileProviderItem?, (any Error)?) -> Void
+	) -> Progress {
+		let state = self.state
+		let answer = CallOnce()
+		return self.inFlight.run(
+			Progress(),
+			onCancel: { answer.fire { completionHandler(nil, userCancelledError()) } }
+		) { [weak self] in
+			do {
+				guard let self else { throw CancellationError() }
+				let rootUuid = try self.getRootUuid()
+				let item = try await Self.resolveItem(
+					state: state, identifier: identifier, rootUuid: rootUuid)
+				answer.fire { completionHandler(item, nil) }
+			} catch {
+				answer.fire { completionHandler(nil, providerError(from: error)) }
+			}
+		}
+	}
+
+	/// A copy of `path` the system may take ownership of.
+	///
+	/// The system "clones and unlinks the received fileContents" (NSFileProviderReplicatedExtension.h,
+	/// File ownership), so handing over the cache slot itself would evict the download the moment
+	/// it is served. The copy goes in the domain's temporary directory because that is the only
+	/// place guaranteed to be on the replica's volume, which is what lets the system clone it.
+	private func stagedContents(at path: String) throws -> URL {
+		guard let manager = self.manager else { throw NSFileProviderError(.cannotSynchronize) }
+		let directory = try manager.temporaryDirectoryURL()
+		let staged = directory.appending(component: UUID().uuidString, directoryHint: .notDirectory)
+		try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: staged)
+		// ponytail: a crash between here and the system's unlink leaks this copy; sweeping the
+		// directory on init would race a second instance of the same domain staging into it.
+		// Revisit with a mtime-gated sweep if the leak ever shows up in disk usage.
+		return staged
+	}
+
+	func fetchContents(
+		for itemIdentifier: NSFileProviderItemIdentifier, version requestedVersion: NSFileProviderItemVersion?,
+		request: NSFileProviderRequest,
+		completionHandler: @escaping (URL?, NSFileProviderItem?, (any Error)?) -> Void
+	) -> Progress {
+		let state = self.state
+		let progress = Progress()
+		let answer = CallOnce()
+		return self.inFlight.run(
+			progress,
+			onCancel: { answer.fire { completionHandler(nil, nil, userCancelledError()) } }
+		) { [weak self] in
+			do {
+				// A nil `self` is this instance being discarded mid-call, not a fact about the
+				// item: `.noSuchItem` here would have the system delete it from disk. A cancelled
+				// operation is transient, which is what it actually was.
+				guard let self else { throw CancellationError() }
+				let rootUuid = try self.getRootUuid()
+				let id = Self.cacheId(for: itemIdentifier, rootUuid: rootUuid)
+				let response = try await state.downloadFileIfChangedWithItem(
+					id: id,
+					progressCallback: ProgressNotifier(
+						set: Self.downloadingSet, id: itemIdentifier.rawValue, progress: progress))
+				let object = FfiObject.file(response.file)
+				// Known, accepted race: the download holds the item's per-file lock only for as
+				// long as it runs, so the lock is gone by the time this copy starts. A
+				// `modifyFileContent` landing in that window uploads the edit and renames the slot
+				// under the freshly minted uuid, and the copy then cannot find the path it was
+				// handed. What surfaces is a plain Cocoa not-found, which is not an
+				// `NSFileProviderError` — so the system retries the fetch rather than acting on it,
+				// and a retry is the right answer: the item really did move. Closing it means
+				// staging Rust-side instead: a download variant that copies into the domain's
+				// temporary directory while it still holds the lock and hands back that path.
+				// Deferred deliberately — a retried fetch costs one round trip, and the FFI half is
+				// the larger part of the fix.
+				let staged = try self.stagedContents(at: response.path)
+				let item = FileProviderItem(
+					itemIdentifier: itemIdentifier, object: object,
+					parentItemIdentifier: Self.containerIdentifier(
+						for: object, fallbackFrom: itemIdentifier, rootUuid: rootUuid))
+				answer.fire { completionHandler(staged, item, nil) }
+			} catch {
+				answer.fire { completionHandler(nil, nil, providerError(from: error)) }
+			}
+		}
+	}
+
+	// MARK: - Writing items
+
+	/// Whether a create template describes a directory rather than a file.
+	///
+	/// Conformance to `.directory`, not `.folder`: a package (`com.apple.package` — .rtfd, .key,
+	/// .app) is a directory on disk that conforms to `public.directory` but NOT to `public.folder`.
+	/// Taken for a file it arrives with nil contents, is created as an empty file, and syncs as a
+	/// 0-byte item whose children then have nowhere to be created.
+	static func createsDirectory(contentType: UTType?) -> Bool {
+		contentType?.conforms(to: .directory) ?? false
+	}
+
+	func createItem(
+		basedOn itemTemplate: NSFileProviderItem, fields: NSFileProviderItemFields,
+		contents url: URL?, options: NSFileProviderCreateItemOptions,
+		request: NSFileProviderRequest,
+		completionHandler: @escaping (
+			NSFileProviderItem?, NSFileProviderItemFields, Bool, (any Error)?
+		) -> Void
+	) -> Progress {
+		let state = self.state
+		let progress = Progress()
+		let answer = CallOnce()
+		let abort = FfiAbortController()
+		return self.inFlight.run(
+			progress,
+			onCancel: { answer.fire { completionHandler(nil, [], false, userCancelledError()) } }
+		) { [weak self] in
+			do {
+				// Discarded mid-call. Transient, not an answer about the item.
+				guard let self else { throw CancellationError() }
+				let rootUuid = try self.getRootUuid()
+				let parentIdentifier = itemTemplate.parentItemIdentifier
+				let parent = Self.cacheId(for: parentIdentifier, rootUuid: rootUuid)
+				let name = itemTemplate.filename
+				// Optional-of-optional throughout: every one of these is an @optional protocol member on an
+				// existential, so the value is `T??` — absent because the item does not implement it, or
+				// implemented and nil.
+				let created = (itemTemplate.creationDate ?? nil).map {
+					Int64($0.timeIntervalSince1970 * 1000)
+				}
+				let contentType = itemTemplate.contentType ?? nil
+
+				var object: FfiObject
+				// Whether the system should re-fetch the item's contents after this create — set
+				// on the adopt path below when the local copy's bytes cannot be assumed to match
+				// the adopted server head.
+				var fetchContents = false
+				// Placing the item is all any branch has in common; what else it carries over
+				// depends on the call it makes. Whatever is left of `fields` comes back as
+				// stillPendingFields, which is how the system learns what this provider cannot
+				// carry: "If the provider is not able to apply all the fields at once, it should
+				// return a set of stillPendingFields in its completion handler."
+				var applied: NSFileProviderItemFields = [.filename, .parentItemIdentifier]
+				if Self.createsDirectory(contentType: contentType) {
+					object = .dir(
+						try await state.createDir(parentPath: parent, name: name, created: created)
+							.dir)
+					applied.insert(.creationDate)
+				} else if let url {
+					// A reimport with contents (backup restore, device migration, fileproviderd
+					// rebuild — the system re-creates ALL cached-on-disk items this way, clean
+					// ones included): ADOPT the existing server item for this (parent, name)
+					// instead of uploading. Uploading replaced the server head with whatever
+					// bytes this replica happened to hold — a stale-but-clean replica silently
+					// rolled back every edit made elsewhere. The system reconciles contents
+					// itself once it has the adopted item; genuinely dirty local bytes still
+					// reach the server through its own conflict handling. Only when the server
+					// has no such item is the local copy the only copy, and uploading it is
+					// exactly right.
+					var adopted: FfiObject?
+					if options.contains(.mayAlreadyExist) {
+						switch try await state.updateAndQueryChild(parent: parent, name: name) {
+						case .file(let existing):
+							// Divergence check before trusting the local bytes as the adopted
+							// head's content: a size mismatch defers to the server; matching
+							// sizes compare the server's plaintext BLAKE3 against the local
+							// file's (size equality alone would mislabel a same-length edit);
+							// and no server hash re-fetches — the safe direction.
+							let localSize =
+								(try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+								?? nil
+							if localSize.map({ Int64($0) != existing.size }) ?? true {
+								fetchContents = true
+							} else if let serverHash = existing.meta?.hash {
+								let localHash = try await state.blake3HashFile(
+									osPath: url.path(percentEncoded: false))
+								fetchContents = localHash != serverHash
+							} else {
+								fetchContents = true
+							}
+							adopted = .file(existing)
+						case .dir(let existingDir):
+							// The name belongs to a DIRECTORY server-side now. Falling through
+							// to the upload planted a same-named file next to the real folder
+							// (the server's name dedup is per item type) from possibly-stale
+							// bytes, silently. A collision carrying the colliding ITEM is the
+							// header-prescribed answer ("use fileProviderErrorForCollision"),
+							// so the system can resolve against it.
+							throw NSError.fileProviderErrorForCollision(
+								with: FileProviderItem(
+									itemIdentifier: Self.itemIdentifier(
+										for: .dir(existingDir), fallback: parent),
+									object: .dir(existingDir),
+									parentItemIdentifier: parentIdentifier))
+						case .root:
+							// A root can never legitimately answer a child-name probe; treat it
+							// as a plain collision (there is no representable colliding item).
+							throw NSFileProviderError(.filenameCollision)
+						case nil:
+							break
+						}
+					}
+					if let adopted {
+						object = adopted
+						applied.formUnion([.contents, .creationDate, .contentModificationDate])
+					} else {
+						let modified = (itemTemplate.contentModificationDate ?? nil).map {
+							Int64($0.timeIntervalSince1970 * 1000)
+						}
+						let info = UploadFileInfo(
+							name: name, creation: created, modification: modified,
+							mime: contentType?.preferredMIMEType)
+						object = .file(
+							try await state.uploadNewFileAbortable(
+								osPath: url.path(percentEncoded: false), parentPath: parent,
+								info: info,
+								progressCallback: ProgressNotifier(
+									set: Self.uploadingSet, id: itemTemplate.itemIdentifier.rawValue,
+									progress: progress),
+								abort: abort.signal()
+							).file)
+						applied.formUnion([.contents, .creationDate, .contentModificationDate])
+					}
+				} else if options.contains(.mayAlreadyExist) {
+					// A reimport of a dataless file: there are no bytes to send, and we cannot
+					// match it to an item of ours from a name alone. Refusing it (nil item, no
+					// error) drops the placeholder from disk; the item itself is untouched on the
+					// server and comes back with the next enumeration.
+					Self.logger.info("refusing to reimport dataless item \(name)")
+					answer.fire { completionHandler(nil, [], false, nil) }
+					return
+				} else {
+					// The empty-file call carries no dates, so neither date is applied here.
+					object = .file(
+						try await state.createEmptyFile(
+							parentPath: parent, name: name, mime: contentType?.preferredMIMEType
+						).file)
+				}
+
+				if fields.contains(.tagData), let tagData = itemTemplate.tagData ?? nil {
+					object = try state.insertIntoLocalDataForPath(
+						path: Self.itemIdentifier(for: object, fallback: parent).rawValue,
+						key: LOCAL_DATA_TAGS, value: tagData.base64EncodedString())
+					applied.insert(.tagData)
+				}
+
+				let item = FileProviderItem(
+					itemIdentifier: Self.itemIdentifier(for: object, fallback: parent),
+					object: object, parentItemIdentifier: parentIdentifier)
+				answer.fire {
+					completionHandler(item, fields.subtracting(applied), fetchContents, nil)
+				}
+			} catch {
+				answer.fire { completionHandler(nil, [], false, providerError(from: error)) }
+			}
+		}
+	}
+
+	/// One cache operation a `modifyItem` call breaks down into.
+	enum ModifyStep: Equatable {
+		/// Replace the file's bytes with the ones the system handed over.
+		case contents
+		case trash
+		/// Restore out of the trash, into `to` when the system asked for a specific parent (the
+		/// cache moves it there itself) or back where it came from when it did not.
+		case restore(to: String?)
+		case move(to: String)
+		case rename(String)
+		case favoriteRank(Int64)
+		/// Provider-local metadata the drive itself has no field for.
+		case localData(key: String, value: String?)
+	}
+
+	/// The steps a change dispatches to, in the order they are applied.
+	///
+	/// Content first: the bytes are what the user is waiting on, and the id addressing the file
+	/// survives every other step. Trash/restore/move before the rename, so a rename that collides
+	/// collides in the container the item ends up in. Purely local fields last — they cannot fail
+	/// in a way that should abandon the rest.
+	///
+	/// A step that fails part-way leaves the earlier ones applied, deliberately: the change is
+	/// already on disk, which is the state this call is catching the drive up to, so undoing a
+	/// committed step would push down a change the user never made. The system retries the whole
+	/// modification, and every step here replays as a no-op once it has landed.
+	///
+	/// Pure, and taking the pieces rather than the extension, so the dispatch table is testable.
+	static func modifySteps(
+		changedFields: NSFileProviderItemFields, item: NSFileProviderItem, hasContents: Bool,
+		currentlyTrashed: Bool, rootUuid: String
+	) -> [ModifyStep] {
+		var steps: [ModifyStep] = []
+		// `.contents` without a file to read is the system telling us the content changed while
+		// having nothing to hand over; there is nothing to upload.
+		if changedFields.contains(.contents) && hasContents { steps.append(.contents) }
+		if changedFields.contains(.parentItemIdentifier) {
+			let parent = item.parentItemIdentifier
+			if parent == .trashContainer {
+				steps.append(.trash)
+			} else if currentlyTrashed {
+				steps.append(.restore(to: cacheId(for: parent, rootUuid: rootUuid)))
+			} else {
+				steps.append(.move(to: cacheId(for: parent, rootUuid: rootUuid)))
+			}
+		}
+		if changedFields.contains(.filename) { steps.append(.rename(item.filename)) }
+		if changedFields.contains(.favoriteRank) {
+			steps.append(.favoriteRank((item.favoriteRank ?? nil)?.int64Value ?? 0))
+		}
+		if changedFields.contains(.tagData) {
+			let tagData = item.tagData ?? nil
+			steps.append(
+				.localData(
+					key: LOCAL_DATA_TAGS,
+					value: (tagData?.isEmpty ?? true) ? nil : tagData?.base64EncodedString()))
+		}
+		if changedFields.contains(.lastUsedDate) {
+			steps.append(
+				.localData(
+					key: LOCAL_DATA_LAST_USED,
+					value: (item.lastUsedDate ?? nil).map {
+						String(Int64($0.timeIntervalSince1970 * 1000))
+					}))
+		}
+		return steps
+	}
+
+	/// The field a step is the application of — the inverse of the dispatch above.
+	private static func field(of step: ModifyStep) -> NSFileProviderItemFields {
+		switch step {
+		case .contents: return .contents
+		case .trash, .restore, .move: return .parentItemIdentifier
+		case .rename: return .filename
+		case .favoriteRank: return .favoriteRank
+		case .localData(let key, _): return key == LOCAL_DATA_TAGS ? .tagData : .lastUsedDate
+		}
+	}
+
+	/// What the system asked for that the dispatch above does not apply.
+	///
+	/// This is the answer to `stillPendingFields`, and it is how the system learns what this
+	/// provider carries: "If the provider is not able to apply all the fields at once, it should
+	/// return a set of stillPendingFields in its completion handler. In that case, the system will
+	/// attempt to modify the item later by calling modifyItem with those fields. [...] if the set
+	/// of stillPendingFields returned by the provider is identical to the set of fields passed to
+	/// modifyItem, then the system will consider that these fields are not supported by the
+	/// provider." Reporting none instead claims every field landed, so the system writes its own
+	/// copy back over the disk and re-sends the same field forever.
+	static func stillPendingFields(
+		changedFields: NSFileProviderItemFields, steps: [ModifyStep]
+	) -> NSFileProviderItemFields {
+		changedFields.subtracting(steps.reduce(into: []) { $0.formUnion(field(of: $1)) })
+	}
+
+	/// Runs one step and hands back what the item became.
+	static func apply(
+		_ step: ModifyStep, state: FilenMobileCacheState, id: String, contents: URL?,
+		progress: Progress?
+	) async throws -> FfiObject {
+		switch step {
+		case .contents:
+			guard let contents else { throw NSFileProviderError(.noSuchItem) }
+			// The upload is the one step whose failure loses the user's bytes, so it is the one
+			// step worth retrying. A failure past the retries still leaves the edit marked in the
+			// cache for the launch drain to deliver.
+			var uploaded: FileWithPathResponse?
+			let failure = await retrying(
+				attempts: uploadAttempts,
+				operation: {
+					uploaded = try await state.modifyFileContent(
+						id: id, osPath: contents.path(percentEncoded: false),
+						progressCallback: ProgressNotifier(
+							set: uploadingSet, id: id, progress: progress))
+				},
+				onRetry: { attempt in
+					Self.logger.error("content upload attempt \(attempt) failed for \(id)")
+					try? await Task.sleep(for: .seconds(1 << (attempt - 1)))
+				})
+			if let failure { throw failure }
+			guard let uploaded else { throw NSFileProviderError(.cannotSynchronize) }
+			return .file(uploaded.file)
+		case .trash:
+			return try await state.trashItem(path: id).object
+		case .restore(let to):
+			// The cache moves the item on if the requested parent is not the one it was trashed
+			// out of, so this is the whole of an untrash-somewhere-else.
+			return try await state.restoreItem(uuid: id, to: to).object
+		case .move(let to):
+			return try await state.moveItem(item: id, newParent: to).object
+		case .rename(let name):
+			guard let renamed = try await state.renameItem(item: id, newName: name) else {
+				// nil is the cache saying "already named that" — the replay of a rename that
+				// was applied before the reply got lost. Answer with the current item as a
+				// success: throwing .filenameCollision here made every such replay read as a
+				// conflict the system then tried to resolve against the item itself.
+				guard let current = try await state.updateAndQueryItem(id: id) else {
+					throw NSFileProviderError(.noSuchItem)
+				}
+				return current
+			}
+			return renamed.object
+		case .favoriteRank(let rank):
+			return try await state.setFavoriteRank(item: id, favoriteRank: rank).object
+		case .localData(let key, let value):
+			return try state.insertIntoLocalDataForPath(path: id, key: key, value: value)
+		}
+	}
+
+	func modifyItem(
+		_ item: NSFileProviderItem, baseVersion version: NSFileProviderItemVersion,
+		changedFields: NSFileProviderItemFields, contents newContents: URL?,
+		options: NSFileProviderModifyItemOptions, request: NSFileProviderRequest,
+		completionHandler: @escaping (
+			NSFileProviderItem?, NSFileProviderItemFields, Bool, (any Error)?
+		) -> Void
+	) -> Progress {
+		let state = self.state
+		let progress = Progress()
+		let answer = CallOnce()
+		return self.inFlight.run(
+			progress,
+			onCancel: { answer.fire { completionHandler(nil, [], false, userCancelledError()) } }
+		) { [weak self] in
+			do {
+				// Discarded mid-call. Transient, not an answer about the item.
+				guard let self else { throw CancellationError() }
+				let rootUuid = try self.getRootUuid()
+				let identifier = item.itemIdentifier
+				let id = Self.cacheId(for: identifier, rootUuid: rootUuid)
+
+				// `baseVersion` is deliberately not compared against the item we hold: v1 policy
+				// is server-wins, so a remote edit made since the system last saw the item is not
+				// a conflict to reject — the upload lands on top of it and the change feed tells
+				// the system what the file became. (The provider does not declare
+				// NSExtensionFileProviderSupportsFailingUploadOnConflict, so the system never
+				// asks for the other behaviour through `.failOnConflict` either.)
+				// A lookup failure is not "not trashed": reading a trashed item as live turns the
+				// restore into a move, which leaves it in the trash under a new parent. A miss is
+				// different — the item may only exist on the server — and still means .move.
+				var cached: FfiObject?
+				do {
+					cached = try state.queryItem(path: id)
+				} catch CacheError.DoesNotExist(_) {
+					cached = nil
+				}
+				let currentlyTrashed = objectIsTrashed(cached)
+				let steps = Self.modifySteps(
+					changedFields: changedFields, item: item, hasContents: newContents != nil,
+					currentlyTrashed: currentlyTrashed, rootUuid: rootUuid)
+				let stillPending = Self.stillPendingFields(
+					changedFields: changedFields, steps: steps)
+
+				var object: FfiObject?
+				for step in steps {
+					object = try await Self.apply(
+						step, state: state, id: id, contents: newContents, progress: progress)
+				}
+
+				// Nothing to do (or nothing we handle): answer with the item as it stands, which
+				// is what the system compares its own copy against.
+				guard let object else {
+					let unchanged = try await Self.resolveItem(
+						state: state, identifier: identifier, rootUuid: rootUuid)
+					answer.fire { completionHandler(unchanged, stillPending, false, nil) }
+					return
+				}
+				let modified = FileProviderItem(
+					itemIdentifier: identifier, object: object,
+					parentItemIdentifier: Self.containerIdentifier(
+						for: object, fallbackFrom: identifier, rootUuid: rootUuid))
+				answer.fire { completionHandler(modified, stillPending, false, nil) }
+			} catch {
+				answer.fire { completionHandler(nil, [], false, providerError(from: error)) }
+			}
+		}
+	}
+
+	/// Whether `id` names a directory that still holds something — the question a non-recursive
+	/// delete has to answer before the cache takes a whole subtree with it.
+	///
+	/// Nothing here fails open. A lookup error propagates, because a failed read says nothing about
+	/// emptiness and reading it as empty deletes the children. An empty cached listing does not
+	/// prove emptiness either — a directory nobody has enumerated has no child rows at all — so it
+	/// costs one relist to tell the two apart. Only directories get that far: for a file the first
+	/// lookup answers no.
+	static func isNonEmptyDirectory(state: FilenMobileCacheState, id: String) async throws -> Bool {
+		var object = try state.queryItem(path: id)
+		if object == nil { object = try await state.updateAndQueryItem(id: id) }
+		guard case .dir(_) = object else { return false }
+
+		// ponytail: a cached child is taken at face value — if it was deleted remotely since, this
+		// refuses a deletion that would have been legal, and the system re-creates the directory
+		// from the metadata it has. Refusing is the safe direction; relist here too if it bites.
+		if let cached = try state.queryDirChildren(path: id, orderBy: nil), !cached.objects.isEmpty {
+			return true
+		}
+		// One row is enough to refuse the deletion; the relist itself is what this is for.
+		let listed = try await state.updateAndQueryDirChildrenPage(
+			path: id, orderBy: nil, offset: 0, limit: 1, refresh: true)
+		return !(listed?.objects.isEmpty ?? true)
+	}
+
+	func deleteItem(
+		identifier: NSFileProviderItemIdentifier, baseVersion version: NSFileProviderItemVersion,
+		options: NSFileProviderDeleteItemOptions, request: NSFileProviderRequest,
+		completionHandler: @escaping ((any Error)?) -> Void
+	) -> Progress {
+		let state = self.state
+		let answer = CallOnce()
+		return self.inFlight.run(
+			Progress(),
+			onCancel: { answer.fire { completionHandler(userCancelledError()) } }
+		) { [weak self] in
+			do {
+				// Discarded mid-call. Transient, not an answer about the item.
+				guard let self else { throw CancellationError() }
+				let rootUuid = try self.getRootUuid()
+				let id = Self.cacheId(for: identifier, rootUuid: rootUuid)
+
+				// The cache deletes a directory with everything under it. Without the recursive
+				// option the header requires the opposite: "If the options don't include
+				// NSFileProviderDeleteItemRecursive and the deletion targets a non-empty directory,
+				// the extension must reject the deletion with the NSFileProviderErrorDirectoryNotEmpty
+				// error code." — NSFileProviderReplicatedExtension.h
+				if !options.contains(.recursive),
+					try await Self.isNonEmptyDirectory(state: state, id: id)
+				{
+					throw NSFileProviderError(.directoryNotEmpty)
+				}
+
+				try await state.deleteItem(item: id)
+				answer.fire { completionHandler(nil) }
+			} catch CacheError.DoesNotExist(_) {
+				// "If the deletion targets an item that is unknown from the extension because that
+				// item may have already been deleted remotely, then the extension should report a
+				// success." — NSFileProviderReplicatedExtension.h
+				answer.fire { completionHandler(nil) }
+			} catch {
+				answer.fire { completionHandler(providerError(from: error)) }
+			}
+		}
+	}
+
+	// MARK: - Enumeration
+
+	func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest)
+		throws -> NSFileProviderEnumerator
 	{
 		do {
+			if containerItemIdentifier == .workingSet {
+				return WorkingSetEnumerator(
+					state: self.state, rootUuid: try self.getRootUuid(), inFlight: self.inFlight)
+			}
 			return FileProviderEnumerator(
 				enumeratedItemIdentifier: containerItemIdentifier, state: self.state,
 				rootUuid: try self.getRootUuid())
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
+			// Everything, not just CacheError: "Errors must be in one of the following domains:
+			// NSCocoaErrorDomain, NSFileProviderErrorDomain." — NSFileProviderReplicatedExtension.h
+		} catch { throw providerError(from: error) }
 	}
 
-	// MARK: - Managing shared files
-
-	/// What to do with a locally changed item, once its path lookup has been attempted.
-	enum ItemChangedResolution: Equatable {
-		/// Resolved — upload from this path.
-		case upload(String)
-		/// The cache genuinely does not know this uuid. There is nothing to retry.
-		case unknownItem
-		/// The lookup itself failed, so we do not know whether the item exists. The edit must not
-		/// be dropped silently — signal so the system asks again.
-		case needsRetry
-	}
-
-	/// Splits "look the item up" from "act on it" so the failure handling is testable.
-	///
-	/// A failed lookup and a missing item are NOT the same: swallowing a thrown lookup error would
-	/// strand a local edit with no upload and no retry signal, silently losing the user's change.
-	static func resolveItemChanged(
-		uuid: String, queryPath: (String) throws -> String?
-	) -> ItemChangedResolution {
-		do {
-			guard let path = try queryPath(uuid) else { return .unknownItem }
-			return .upload(path)
-		} catch {
-			return .needsRetry
-		}
-	}
+	// MARK: - Retrying
 
 	/// Runs an operation, retrying a bounded number of times; nil on success, else the last error.
 	///
-	/// A failed upload out of `itemChanged` is a lost user edit — nothing re-triggers
-	/// `itemChanged`, and the working-set signal that would normally ask the system to re-examine
-	/// the item does not work here (see the TODOs below). Retrying recovers transient failures, a
+	/// A failed content upload is a lost user edit. Retrying recovers transient failures, a
 	/// dropped connection or a server blip, which are the common case. It cannot recover a
-	/// permanent failure or a process death mid-retry; those still need working-set support.
+	/// permanent failure or a process death mid-retry; the cache's pending-upload marker and the
+	/// drain at launch cover those.
+	///
+	/// A cancelled operation is not a failure and is never retried: the call it belongs to has
+	/// already been answered from the `Progress` cancellation handler, so a retry would upload the
+	/// file again for nobody. The check is at the top of the loop because the backoff swallows
+	/// cancellation (`try? await Task.sleep`) — this is where a loop cancelled mid-sleep stops.
 	static func retrying(
 		attempts: Int,
 		operation: () async throws -> Void,
@@ -331,9 +981,12 @@ class FileProviderExtension: NSFileProviderExtension {
 	) async -> Error? {
 		var lastError: Error?
 		for attempt in 1...max(1, attempts) {
+			if Task.isCancelled { return lastError ?? CancellationError() }
 			do {
 				try await operation()
 				return nil
+			} catch is CancellationError {
+				return CancellationError()
 			} catch {
 				lastError = error
 				if attempt < attempts { await onRetry(attempt) }
@@ -342,354 +995,7 @@ class FileProviderExtension: NSFileProviderExtension {
 		return lastError
 	}
 
-	override func itemChanged(at url: URL) {
-		guard let uuid = uuidFromCacheItemURL(url) else {
-			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
-			return
-		}
-		let resolution = Self.resolveItemChanged(uuid: uuid) { uuid in
-			try self.state.queryPathForUuid(uuid: uuid)
-		}
-
-		let path: String
-		switch resolution {
-		case .upload(let resolved):
-			path = resolved
-		case .unknownItem:
-			Self.logger.error("no item found for uuid \(uuid)")
-			return
-		case .needsRetry:
-			// TODO: there is no retry mechanism to reach for yet. Signalling the working set is
-			// the idiomatic way to ask the system to re-examine items needing sync, but this
-			// provider does not implement `enumerateChanges`, and the working set's sentinel is
-			// not even a resolvable cache id — enumerating it throws (pinned by
-			// CacheStableIdTests.testTheWorkingSetSentinelIsNotAResolvableCacheId). Signalling it
-			// would only generate error noise, so log loudly and drop through until working-set
-			// support lands.
-			Self.logger.error("could not resolve uuid \(uuid), local edit not uploaded")
-			return
-		}
-
-		Task {
-			// A fresh notifier per attempt: each one holds its own slot and releases it on the way
-			// out, so a retry re-marks the item as uploading.
-			let failure = await Self.retrying(
-				attempts: Self.uploadAttempts,
-				operation: {
-					let _ = try await self.state.uploadFileIfChanged(
-						path: path,
-						progressCallback: ProgressNotifier(set: Self.uploadingSet, uuid: uuid))
-				},
-				onRetry: { attempt in
-					Self.logger.error("itemChanged upload attempt \(attempt) failed for \(uuid)")
-					try? await Task.sleep(for: .seconds(1 << (attempt - 1)))
-				})
-
-			if let failure {
-				// TODO: the retries are exhausted and there is nothing left to fall back on. The
-				// idiomatic move is to signal the working set so the system re-examines the item,
-				// but this provider does not implement `enumerateChanges` and the working set's
-				// sentinel is not a resolvable cache id — enumerating it throws (pinned by
-				// CacheStableIdTests.testTheWorkingSetSentinelIsNotAResolvableCacheId). Until that
-				// lands, an edit that fails this many times is lost until the item changes again.
-				Self.logger.error(
-					"itemChanged upload failed for uuid \(uuid), not persisted: \(failure)")
-			}
-		}
-	}
-
-	override func providePlaceholder(at url: URL) async throws {
-		guard let identifier = persistentIdentifierForItem(at: url) else {
-			throw NSFileProviderError(.noSuchItem)
-		}
-
-		let placeholderDirectoryUrl = url.deletingLastPathComponent()
-		let fileProviderItem = try item(for: identifier)
-		let placeholderURL = NSFileProviderManager.placeholderURL(for: url)
-
-		if !FileManager.default.fileExists(atPath: placeholderDirectoryUrl.path) {
-			try FileManager.default.createDirectory(
-				at: placeholderDirectoryUrl, withIntermediateDirectories: true)
-		}
-
-		try NSFileProviderManager.writePlaceholder(
-			at: placeholderURL, withMetadata: fileProviderItem)
-	}
-
-	override func startProvidingItem(at url: URL) async throws {
-		do {
-			guard let uuid = uuidFromCacheItemURL(url) else {
-				throw NSFileProviderError(.noSuchItem)
-			}
-			guard let obj = try self.state.queryItemByUuid(uuid: uuid) else {
-				throw NSFileProviderError(.noSuchItem)
-			}
-			if case .file(_) = obj {
-				let _ = try await self.state.downloadFileIfChangedByUuid(
-					uuid: uuid,
-					progressCallback: ProgressNotifier(set: Self.downloadingSet, uuid: uuid))
-			}
-
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func stopProvidingItem(at url: URL) {
-		guard let uuid = uuidFromCacheItemURL(url) else {
-			Self.logger.error("not a cache item URL: \(url.path(percentEncoded: false))")
-			return
-		}
-		// KNOWN GAP: this detached Task is uncancellable and nothing orders it against a
-		// subsequent download of the same uuid — `clear_local_cache_by_uuid` selects then deletes
-		// with no per-uuid lock on the Rust side either (remote.rs:842). If the system stops
-		// providing an item and immediately re-requests it, the clear can land after the fresh
-		// download and evict it, and the next open re-downloads. Recoverable and transient, so it
-		// is documented rather than worked around; the fix is per-uuid serialisation in the cache,
-		// not here. Deliberately untested: any assertion about which of two unordered operations
-		// wins would be flaky by construction.
-		Task {
-			do {
-				try await self.state.clearLocalCacheByUuid(uuid: uuid)
-			} catch {
-				Self.logger.error("stopProvidingItem failed for uuid \(uuid): \(error)")
-			}
-		}
-	}
-
-	// MARK: - Handling actions
-	override func createDirectory(
-		withName directoryName: String,
-		inParentItemIdentifier parentItemIdentifier: NSFileProviderItemIdentifier
-	) async throws -> NSFileProviderItem {
-		do {
-			let path =
-				if parentItemIdentifier == .rootContainer { try self.getRootUuid() } else {
-					parentItemIdentifier.rawValue
-				}
-			let resp = try await self.state.createDir(
-				parentPath: path, name: directoryName, created: nil)
-
-			return FileProviderItem(
-				itemIdentifier: Self.itemIdentifier(for: FfiObject.dir(resp.dir), fallback: resp.id),
-				object: FfiObject.dir(resp.dir),
-				parentItemIdentifier: parentItemIdentifier)
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func deleteItem(withIdentifier itemIdentifier: NSFileProviderItemIdentifier)
-		async throws
-	{
-		do { try await self.state.deleteItem(item: itemIdentifier.rawValue) } catch let cacheError
-			as CacheError
-		{ throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func importDocument(
-		at fileURL: URL, toParentItemIdentifier parentItemIdentifier: NSFileProviderItemIdentifier
-	) async throws -> NSFileProviderItem {
-		do {
-			if !fileURL.startAccessingSecurityScopedResource() {
-				throw NSFileProviderError(.noSuchItem)
-			}
-			defer { fileURL.stopAccessingSecurityScopedResource() }
-			let parent =
-				if parentItemIdentifier == .rootContainer { try self.getRootUuid() } else {
-					parentItemIdentifier.rawValue
-				}
-			let resourceValues = try fileURL.resourceValues(forKeys: [
-				.nameKey, .isDirectoryKey, .creationDateKey, .contentModificationDateKey,
-				.typeIdentifierKey,
-			])
-			guard let name = resourceValues.name else {
-				throw NSFileProviderError(.noSuchItem)
-			}
-			let creationInterval = resourceValues.creationDate?.timeIntervalSince1970
-			let creationTimeStamp = creationInterval.map { Int64($0 * 1000) }
-
-			let isDirectory = resourceValues.isDirectory ?? false
-			let item: FileProviderItem
-			if isDirectory {
-				let info = try await self.state.createDir(
-					parentPath: parent, name: name, created: creationTimeStamp)
-				item = FileProviderItem(
-					itemIdentifier: Self.itemIdentifier(
-						for: FfiObject.dir(info.dir), fallback: info.id),
-					object: FfiObject.dir(info.dir),
-					parentItemIdentifier: parentItemIdentifier)
-			} else {
-				let modificationInterval = resourceValues.contentModificationDate?
-					.timeIntervalSince1970
-				let modificationTimeStamp = modificationInterval.map { Int64($0 * 1000) }
-				let info = UploadFileInfo(
-					name: name, creation: creationTimeStamp, modification: modificationTimeStamp,
-					mime: resourceValues.typeIdentifier.flatMap { UTType($0)?.preferredMIMEType })
-				let resp = try await self.state.uploadNewFile(
-					osPath: fileURL.path(percentEncoded: false), parentPath: parent, info: info,
-					progressCallback: nil)
-				item = FileProviderItem(
-					itemIdentifier: Self.itemIdentifier(
-						for: FfiObject.file(resp.file), fallback: resp.id),
-					object: FfiObject.file(resp.file),
-					parentItemIdentifier: parentItemIdentifier)
-			}
-			return item
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func renameItem(
-		withIdentifier itemIdentifier: NSFileProviderItemIdentifier, toName itemName: String
-	) async throws -> NSFileProviderItem {
-		do {
-			let resp = try await self.state.renameItem(
-				item: itemIdentifier.rawValue, newName: itemName)
-			guard let item = resp else { throw NSFileProviderError(.filenameCollision) }
-			let identifier = Self.itemIdentifier(for: item.object, fallback: item.id)
-			return FileProviderItem(
-				itemIdentifier: identifier, object: item.object,
-				parentItemIdentifier: self.containerIdentifier(
-					for: item.object, fallbackFrom: identifier))
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	/// Moves an item and optionally renames it, rolling the move back if the rename fails.
-	///
-	/// The two steps are separate server calls with no transaction between them. Without the
-	/// rollback a failed rename reports total failure while the move has already committed, so the
-	/// system keeps showing the item in its old container while the server has it in the new one.
-	/// Compensating means a thrown error truthfully says "nothing changed".
-	///
-	/// Static, and taking `state`, so the sequence is testable without a FileProviderExtension.
-	static func reparent(
-		state: FilenMobileCacheState,
-		itemIdentifier: NSFileProviderItemIdentifier,
-		newParent: String,
-		newName: String?,
-		parentItemIdentifier: NSFileProviderItemIdentifier
-	) async throws -> FileProviderItem {
-		do {
-			// Captured before the move so the rollback knows where to put the item back.
-			let originalParent = (try? state.queryItem(path: itemIdentifier.rawValue))
-				.flatMap { $0 }
-				.flatMap { objectToContainerUuid(object: $0) }
-
-			let resp = try await state.moveItem(item: itemIdentifier.rawValue, newParent: newParent)
-			let moved = FileProviderItem(
-				itemIdentifier: Self.itemIdentifier(for: resp.object, fallback: resp.id),
-				object: resp.object,
-				parentItemIdentifier: parentItemIdentifier)
-
-			guard let newName = newName, moved.filename != newName else { return moved }
-
-			do {
-				guard let renamed = try await state.renameItem(item: resp.id, newName: newName)
-				else { throw NSFileProviderError(.filenameCollision) }
-				return FileProviderItem(
-					itemIdentifier: Self.itemIdentifier(for: renamed.object, fallback: renamed.id),
-					object: renamed.object,
-					parentItemIdentifier: parentItemIdentifier)
-			} catch {
-				// Best effort: if the rollback itself fails there is nothing further to try, but
-				// the original error is still the truthful one to report.
-				if let originalParent {
-					do {
-						_ = try await state.moveItem(item: resp.id, newParent: originalParent)
-					} catch let rollbackError {
-						Self.logger.error(
-							"reparent rollback failed, item left moved: \(rollbackError)")
-					}
-				}
-				throw error
-			}
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func reparentItem(
-		withIdentifier itemIdentifier: NSFileProviderItemIdentifier,
-		toParentItemWithIdentifier parentItemIdentifier: NSFileProviderItemIdentifier,
-		newName: String?
-	) async throws -> NSFileProviderItem {
-		let newParent =
-			if parentItemIdentifier == .rootContainer { try self.getRootUuid() } else {
-				parentItemIdentifier.rawValue
-			}
-		return try await Self.reparent(
-			state: self.state, itemIdentifier: itemIdentifier, newParent: newParent,
-			newName: newName, parentItemIdentifier: parentItemIdentifier)
-	}
-
-	override func setFavoriteRank(
-		_ favoriteRank: NSNumber?, forItemIdentifier itemIdentifier: NSFileProviderItemIdentifier
-	) async throws -> NSFileProviderItem {
-		do {
-			let resp = try await self.state.setFavoriteRank(
-				item: itemIdentifier.rawValue, favoriteRank: favoriteRank?.int64Value ?? 0)
-			let identifier = Self.itemIdentifier(for: resp.object, fallback: resp.id)
-			return FileProviderItem(
-				itemIdentifier: identifier, object: resp.object,
-				parentItemIdentifier: self.containerIdentifier(
-					for: resp.object, fallbackFrom: identifier))
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func setTagData(
-		_ tagData: Data?, forItemIdentifier itemIdentifier: NSFileProviderItemIdentifier
-	) async throws -> NSFileProviderItem {
-		// todo
-		do {
-			let stringData = tagData?.count ?? 0 > 0 ? tagData?.base64EncodedString() : nil
-			let obj = try self.state.insertIntoLocalDataForPath(
-				path: itemIdentifier.rawValue, key: "TagData", value: stringData)
-			return FileProviderItem(
-				itemIdentifier: itemIdentifier, object: obj,
-				parentItemIdentifier: self.containerIdentifier(
-					for: obj, fallbackFrom: itemIdentifier))
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func trashItem(withIdentifier itemIdentifier: NSFileProviderItemIdentifier)
-		async throws -> NSFileProviderItem
-	{
-		do {
-			let resp = try await self.state.trashItem(path: itemIdentifier.rawValue)
-			// signal the container the item vanished from — its ORIGINAL
-			// parent, which the trash response still carries (a stable file
-			// identifier has no path structure to split a parent out of)
-			try await NSFileProviderManager.default.signalEnumerator(
-				for: self.containerIdentifier(for: resp.object, fallbackFrom: itemIdentifier))
-
-			return FileProviderItem(
-				itemIdentifier: Self.itemIdentifier(for: resp.object, fallback: resp.id),
-				object: resp.object,
-				parentItemIdentifier: self.containerIdentifier(
-					for: resp.object, fallbackFrom: itemIdentifier))
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	override func untrashItem(
-		withIdentifier itemIdentifier: NSFileProviderItemIdentifier,
-		toParentItemIdentifier parentItemIdentifier: NSFileProviderItemIdentifier?
-	) async throws -> NSFileProviderItem {
-		do {
-			let uuid =
-				if let lastSlash = itemIdentifier.rawValue.lastIndex(of: "/") {
-					String(
-						itemIdentifier.rawValue[itemIdentifier.rawValue.index(after: lastSlash)...])
-				} else { throw NSFileProviderError(.noSuchItem) }
-			let target: String? =
-				if let parentItemIdentifier = parentItemIdentifier {
-					parentItemIdentifier == .rootContainer
-						? try self.getRootUuid() : parentItemIdentifier.rawValue
-				} else { nil }
-			let resp = try await self.state.restoreItem(
-				uuid: uuid, to: target)
-			let identifier = Self.itemIdentifier(for: resp.object, fallback: resp.id)
-			return FileProviderItem(
-				itemIdentifier: identifier, object: resp.object,
-				parentItemIdentifier: self.containerIdentifier(
-					for: resp.object, fallbackFrom: identifier))
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
-	}
-
-	// MARK: - Accessing thumbnails
+	// MARK: - Thumbnails
 
 	// pretend @Sendable isn't a problem here in Swift 6,
 	// uniffi requires that exposed traits be Send + Sync
@@ -697,50 +1003,50 @@ class FileProviderExtension: NSFileProviderExtension {
 	// this doesn't seem to have caused issues
 	// but I do wish apple would fix this API becuase there's no reason
 	// these shouldn't be @Sendable
-	override func fetchThumbnails(
+	func fetchThumbnails(
 		for itemIdentifiers: [NSFileProviderItemIdentifier], requestedSize size: CGSize,
-		perThumbnailCompletionHandler: @Sendable @escaping (
+		perThumbnailCompletionHandler: @escaping (
 			NSFileProviderItemIdentifier, Data?, Error?
-		) -> Void, completionHandler: @Sendable @escaping (Error?) -> Void
+		) -> Void, completionHandler: @escaping (Error?) -> Void
 	) -> Progress {
 		Self.logger.debug("fetchThumbnails for \(itemIdentifiers.count) items")
 		let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+		// This call has a real cancellation hook — the Rust thumbnail task takes one — but the
+		// framework still wants the completion answered from the cancellation handler, and the
+		// cancelled task may answer it too.
+		let answer = CallOnce()
+		// Deregistration runs from the completion handler, so the entry never outlives the
+		// work; `register` before the call so a teardown racing it still finds something.
+		let deregister = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
 		let fetchHandler = FetchThumbnailHandler(
 			perThumbnailCompletionHandler: perThumbnailCompletionHandler,
-			completionHandler: completionHandler, progress: progress)
+			completionHandler: { error in
+				deregister.withLock { $0?() }
+				answer.fire { completionHandler(error) }
+			},
+			progress: progress)
 		do {
 			let thumbnailTask = try self.state.getThumbnails(
 				items: itemIdentifiers.map { $0.rawValue }, requestedWidth: UInt32(size.width),
 				requestedHeight: UInt32(size.height), callback: fetchHandler)
-			progress.cancellationHandler = { thumbnailTask.cancel() }
+			// In the registry as well as on the progress: `invalidate()` cancels through
+			// `cancelAll` only, so without this the one call with a real Rust-side cancel was
+			// the one teardown could not stop.
+			let unregister = self.inFlight.register {
+				answer.fire { completionHandler(userCancelledError()) }
+				thumbnailTask.cancel()
+			}
+			deregister.withLock { $0 = unregister }
+			progress.cancellationHandler = {
+				unregister()
+				answer.fire { completionHandler(userCancelledError()) }
+				thumbnailTask.cancel()
+			}
 		} catch let error {
 			// getThumbnails should throw a CacheError, but guard against any
 			// other error type so we never force-crash the extension
-			if let cacheError = error as? CacheError {
-				completionHandler(cacheErrorToError(error: cacheError))
-			} else {
-				completionHandler(error)
-			}
+			answer.fire { completionHandler(providerError(from: error)) }
 		}
 		return progress
-	}
-
-	// MARK: - Working with services
-
-	override func supportedServiceSources(for itemIdentifier: NSFileProviderItemIdentifier) throws
-		-> [NSFileProviderServiceSource]
-	{ [] }
-
-	func objectForId(identifier: NSFileProviderItemIdentifier) throws -> FfiObject? {
-		do {
-			let path =
-				switch identifier {
-				case NSFileProviderItemIdentifier.rootContainer: try self.getRootUuid()
-				case NSFileProviderItemIdentifier.trashContainer: "trash"
-				default: identifier.rawValue
-				}
-
-			return try self.state.queryItem(path: path)
-		} catch let cacheError as CacheError { throw cacheErrorToError(error: cacheError) }
 	}
 }

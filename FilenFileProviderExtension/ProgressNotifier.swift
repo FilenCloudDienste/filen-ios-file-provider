@@ -10,7 +10,11 @@ typealias TransfersInFlight = OSAllocatedUnfairLock<[String: Int]>
 
 final class ProgressNotifier: ProgressCallback {
 	private let set: TransfersInFlight
-	let uuid: String
+	/// The item's whole-life identifier — see `FileProviderItem.isUploading`.
+	let id: String
+	/// The `Progress` handed to the system for this operation, if there is one. The system shows
+	/// it to the user and cancels through it.
+	private let progress: Progress?
 	private let total: OSAllocatedUnfairLock<UInt64> = OSAllocatedUnfairLock(initialState: 0)
 	private let processed: OSAllocatedUnfairLock<UInt64> = OSAllocatedUnfairLock(initialState: 0)
 	/// Guards against releasing this notifier's hold twice — `onProgress` completing and `deinit`
@@ -18,13 +22,17 @@ final class ProgressNotifier: ProgressCallback {
 	private let releasedHold: OSAllocatedUnfairLock<Bool> = OSAllocatedUnfairLock(
 		initialState: false)
 
-	init(set: TransfersInFlight, uuid: String) {
+	init(set: TransfersInFlight, id: String, progress: Progress? = nil) {
 		self.set = set
-		self.uuid = uuid
-		set.withLock { transfers in transfers[uuid, default: 0] += 1 }
+		self.id = id
+		self.progress = progress
+		set.withLock { transfers in transfers[id, default: 0] += 1 }
 	}
 
-	func setTotal(size: UInt64) { self.total.withLock { $0 = size } }
+	func setTotal(size: UInt64) {
+		self.total.withLock { $0 = size }
+		self.progress?.totalUnitCount = Int64(size)
+	}
 
 	/// Gives up this notifier's hold, at most once.
 	private func release() {
@@ -36,11 +44,11 @@ final class ProgressNotifier: ProgressCallback {
 		guard !alreadyReleased else { return }
 
 		self.set.withLock { transfers in
-			guard let remaining = transfers[self.uuid] else { return }
+			guard let remaining = transfers[self.id] else { return }
 			if remaining <= 1 {
-				transfers.removeValue(forKey: self.uuid)
+				transfers.removeValue(forKey: self.id)
 			} else {
-				transfers[self.uuid] = remaining - 1
+				transfers[self.id] = remaining - 1
 			}
 		}
 	}
@@ -50,6 +58,7 @@ final class ProgressNotifier: ProgressCallback {
 			processed += bytesProcessed
 			return processed
 		}
+		self.progress?.completedUnitCount = Int64(processed)
 		let total = self.total.withLock { total in return total }
 		// `total` is 0 until `setTotal` lands, and progress can arrive first — an unguarded
 		// `processed >= total` would treat the very first callback as completion and stop showing

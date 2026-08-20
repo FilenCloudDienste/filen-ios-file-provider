@@ -1,6 +1,21 @@
-import CryptoKit
 import FileProvider
 import UniformTypeIdentifiers
+
+/// The trash, as the system's own container.
+///
+/// The cache has no row for it — it is reachable only through the dedicated trash calls — so the
+/// one item the system may ask for by the trash sentinel is synthesized rather than looked up.
+class TrashContainerItem: NSObject, NSFileProviderItem {
+	var itemIdentifier: NSFileProviderItemIdentifier { .trashContainer }
+	var parentItemIdentifier: NSFileProviderItemIdentifier { .rootContainer }
+	var filename: String { "Trash" }
+	var contentType: UTType { .folder }
+	var capabilities: NSFileProviderItemCapabilities { [.allowsContentEnumerating] }
+	var itemVersion: NSFileProviderItemVersion {
+		NSFileProviderItemVersion(
+			contentVersion: Data("trash".utf8), metadataVersion: Data("trash".utf8))
+	}
+}
 
 class FileProviderItem: NSObject, NSFileProviderItem {
 	private let identifier: NSFileProviderItemIdentifier
@@ -104,28 +119,37 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		}
 	}
 
-	var versionIdentifier: Data? {
-		// build a stable, metadata-inclusive digest so renames / recolors /
-		// favorite changes produce a staleness signal for every item type
-		var components: [String]
+	/// The two versions the system tracks: one for the bytes, one for everything else.
+	///
+	/// `contentVersion` is the file's uuid, which the server re-mints on every content edit and
+	/// version restore and never touches for a rename, move, favourite or trash round-trip — so it
+	/// moves exactly when the bytes do, which is what drives redownloads and thumbnail
+	/// invalidation. A directory has no content, so its content version is a constant.
+	///
+	/// `metadataVersion` is the cache's `change_seq`, a local counter that rises whenever anything
+	/// a replica renders about the item changes and stands still otherwise. Purely local state (a
+	/// cached copy, an outstanding edit) deliberately does not move it.
+	var itemVersion: NSFileProviderItemVersion {
 		switch self.object {
 		case .file(let ffiFile):
-			components = [
-				"file", ffiFile.uuid, ffiFile.parent, "\(ffiFile.size)",
-				"\(ffiFile.favoriteRank)", ffiFile.meta?.name ?? "", ffiFile.meta?.mime ?? "",
-				"\(ffiFile.meta?.modified ?? 0)",
-				ffiFile.meta?.hash?.base64EncodedString() ?? "",
-			]
+			return NSFileProviderItemVersion(
+				contentVersion: Data(ffiFile.uuid.utf8),
+				metadataVersion: Self.versionBytes(ffiFile.changeSeq))
 		case .dir(let ffiDir):
-			components = [
-				"dir", ffiDir.uuid, ffiDir.parent, "\(ffiDir.favoriteRank)",
-				ffiDir.meta?.name ?? "", ffiDir.color ?? "", "\(ffiDir.meta?.created ?? 0)",
-			]
-		case .root(let ffiRoot):
-			components = ["root", ffiRoot.uuid]
+			return NSFileProviderItemVersion(
+				contentVersion: Data(DIRECTORY_CONTENT_VERSION.utf8),
+				metadataVersion: Self.versionBytes(ffiDir.changeSeq))
+		case .root(_):
+			// A root is never replicated as an item; it needs a version only because the system
+			// reads one off whatever it is handed.
+			return NSFileProviderItemVersion(
+				contentVersion: Data(DIRECTORY_CONTENT_VERSION.utf8),
+				metadataVersion: Self.versionBytes(0))
 		}
-		let digest = SHA256.hash(data: Data(components.joined(separator: "\u{0}").utf8))
-		return Data(digest)
+	}
+
+	private static func versionBytes(_ changeSeq: Int64) -> Data {
+		withUnsafeBytes(of: changeSeq.littleEndian) { Data($0) }
 	}
 
 	var contentType: UTType {
@@ -159,12 +183,8 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		// state comes from the object itself (a trashed item's parent renders
 		// as the "trash" sentinel). The prefix check stays for identifiers
 		// handed back by trash responses.
-		if self.identifier.rawValue.starts(with: "trash/") { return true }
-		switch self.object {
-		case .file(let ffiFile): return ffiFile.parent == "trash"
-		case .dir(let ffiDir): return ffiDir.parent == "trash"
-		case .root(_): return false
-		}
+		if self.identifier.rawValue.starts(with: TRASH_CACHE_ID + "/") { return true }
+		return objectIsTrashed(self.object)
 	}
 	var contentModificationDate: Date? {
 		switch self.object {
@@ -202,31 +222,38 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		}
 	}
 
-	var tagData: Data? {
+	/// The provider's own per-item scratch space, where the fields the drive has no column for
+	/// live.
+	private var localData: [String: String]? {
 		switch self.object {
-		case .file(let ffiFile):
-			if let tagData = ffiFile.localData?["TagData"] as? String {
-				return Data(base64Encoded: tagData)
-			} else {
-				return nil
-			}
-		case .dir(let ffiDir):
-			if let tagData = ffiDir.localData?["TagData"] as? String {
-				return Data(base64Encoded: tagData)
-			} else {
-				return nil
-			}
+		case .file(let ffiFile): return ffiFile.localData
+		case .dir(let ffiDir): return ffiDir.localData
 		case .root(_): return nil
 		}
 	}
 
+	var tagData: Data? {
+		guard let tagData = self.localData?[LOCAL_DATA_TAGS] else { return nil }
+		return Data(base64Encoded: tagData)
+	}
+
+	/// The drive has no last-used date, so the one the system sets is kept locally and handed
+	/// straight back — the system's cue for the Recents view.
+	var lastUsedDate: Date? {
+		guard let millis = self.localData?[LOCAL_DATA_LAST_USED].flatMap(Int64.init) else {
+			return nil
+		}
+		return Date(timeIntervalSince1970: TimeInterval(millis) / 1000)
+	}
+
+	// Transfers are keyed by the item's whole-life identifier rather than its uuid: a file's uuid
+	// is re-minted by the very upload being tracked, and a download is started from an identifier
+	// before anything knows the uuid behind it.
 	var isUploading: Bool {
-		let uuid = objectToUuid(object: self.object)
-		return FileProviderExtension.uploadingSet.withLock { transfers in transfers[uuid] != nil }
+		FileProviderExtension.uploadingSet.withLock { $0[self.identifier.rawValue] != nil }
 	}
 
 	var isDownloading: Bool {
-		let uuid = objectToUuid(object: self.object)
-		return FileProviderExtension.downloadingSet.withLock { transfers in transfers[uuid] != nil }
+		FileProviderExtension.downloadingSet.withLock { $0[self.identifier.rawValue] != nil }
 	}
 }

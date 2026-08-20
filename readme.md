@@ -11,7 +11,12 @@
 
 ![Contributors](https://img.shields.io/github/contributors/FilenCloudDienste/filen-ios-file-provider?color=dark-green) ![Forks](https://img.shields.io/github/forks/FilenCloudDienste/filen-ios-file-provider?style=social) ![Stargazers](https://img.shields.io/github/stars/FilenCloudDienste/filen-ios-file-provider?style=social) ![Issues](https://img.shields.io/github/issues/FilenCloudDienste/filen-ios-file-provider) ![License](https://img.shields.io/github/license/FilenCloudDienste/filen-ios-file-provider)
 
-[iOS File Provider Extension Reference](https://developer.apple.com/documentation/fileprovider/nonreplicated-file-provider-extension)
+[iOS File Provider Extension Reference](https://developer.apple.com/documentation/fileprovider/replicated-file-provider-extension)
+
+The extension is a **replicated** provider (`NSFileProviderReplicatedExtension`): the system keeps
+its own copy of the hierarchy on disk and asks this extension for metadata, content, and changes.
+The containing app has to register a domain with `NSFileProviderManager.add(_:)` before the system
+will instantiate it — a replicated extension has no implicit default domain.
 
 ## Building
 1) Place [filen-rs](https://github.com/FilenCloudDienste/filen-rs) next to the root of this object
@@ -20,10 +25,10 @@
 
 ## Testing
 
-`FilenFileProviderTests` is a host-less unit test bundle covering the cache FFI the extension
-depends on for item identity — the `stable/<id>` namespace across renames and moves, plus
-`queryPathForUuid` and `queryItemByUuid`. It runs against the live backend, so it needs the same
-test account as above.
+`FilenFileProviderTests` is a host-less unit test bundle covering what the extension itself cannot
+be run for: a replicated extension does not run in the simulator, so the enumerators, the item
+lookup, the modify dispatch and the cache FFI behind them are driven directly. It runs against the
+live backend, so it needs the same test account as above.
 
 ```sh
 ./run-tests.sh                                   # uses ./.env

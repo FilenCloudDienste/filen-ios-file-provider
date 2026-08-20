@@ -7,8 +7,8 @@ import XCTest
 ///
 /// A `CacheError` that escapes unmapped reaches the system as an opaque Swift error the File
 /// Provider framework cannot interpret — it degrades to a generic failure with no retry
-/// semantics. This table pins all 13 cases so a future binding regeneration that adds a case
-/// cannot silently fall through.
+/// semantics. This table pins every case so a future binding regeneration that adds one cannot
+/// silently fall through.
 final class CacheErrorMappingTests: XCTestCase {
 	private func mapped(_ error: CacheError) -> NSError {
 		cacheErrorToError(error: error) as NSError
@@ -36,6 +36,23 @@ final class CacheErrorMappingTests: XCTestCase {
 		let nsError = mapped(error)
 		XCTAssertEqual(nsError.domain, NSCocoaErrorDomain, file: file, line: line)
 		XCTAssertEqual(nsError.code, expectedCode, file: file, line: line)
+	}
+
+	/// A failure the system must keep retrying: an ordinary Cocoa error carrying the original,
+	/// which is what the header prescribes for a failure with no code of its own — and explicitly
+	/// NOT `.cannotSynchronize`, which is documented as permanent.
+	private func assertRetryable(
+		_ error: CacheError,
+		file: StaticString = #filePath,
+		line: UInt = #line
+	) {
+		let nsError = mapped(error)
+		XCTAssertEqual(nsError.domain, NSCocoaErrorDomain, file: file, line: line)
+		XCTAssertEqual(nsError.code, NSXPCConnectionReplyInvalid, file: file, line: line)
+		XCTAssertNotNil(
+			nsError.userInfo[NSUnderlyingErrorKey],
+			"the failure that could not be represented must be carried along", file: file,
+			line: line)
 	}
 
 	// MARK: - Authentication
@@ -66,19 +83,42 @@ final class CacheErrorMappingTests: XCTestCase {
 		assertFileProviderError(.Remote("502"), .serverUnreachable)
 	}
 
-	/// Local cache/SDK/data failures are not retryable by the system but must still arrive as a
-	/// File Provider error rather than an opaque one.
-	func testLocalFailuresMapToCannotSynchronize() {
-		assertFileProviderError(.Sql("db locked"), .cannotSynchronize)
-		assertFileProviderError(.Sdk("sdk blew up"), .cannotSynchronize)
-		assertFileProviderError(.Conversion("bad shape"), .cannotSynchronize)
+	/// Local cache/SDK/data failures are blips: a busy WAL database with the app writing it too, a
+	/// failed disk write, a row that did not deserialize. Every one of them succeeds on a later
+	/// attempt, so none may reach the system as `.cannotSynchronize` — which stops sync for the
+	/// item "until either: The operating system has been updated. The FileProvider extension has
+	/// been updated. The item is modified on disk." (NSFileProviderError.h)
+	func testTransientLocalFailuresStayRetryable() {
+		assertRetryable(.Sql("database is locked"))
+		assertRetryable(.Sdk("connection reset"))
+		assertRetryable(.Conversion("bad shape"))
+		assertRetryable(.Image("bad jpeg"))
+		assertRetryable(.Io("disk full"))
+
+		for error in [
+			CacheError.Sql("x"), .Sdk("x"), .Conversion("x"), .Image("x"), .Io("x"),
+		] {
+			XCTAssertNotEqual(
+				mapped(error).domain, NSFileProviderErrorDomain,
+				"\(error) must not be answered with a File Provider code that stops sync")
+		}
+	}
+
+	/// The one local failure that is permanent: the same bytes and the same keys fail the same way
+	/// on every retry, which is what `.cannotSynchronize` describes.
+	func testUndecryptableContentIsPermanent() {
 		assertFileProviderError(.FailedToDecrypt("bad key"), .cannotSynchronize)
-		assertFileProviderError(.Image("bad jpeg"), .cannotSynchronize)
-		assertFileProviderError(.Io("disk full"), .cannotSynchronize)
 	}
 
 	func testUnsupportedMapsToTheCocoaFeatureUnsupportedError() {
 		assertCocoaError(.Unsupported("nope"), NSFeatureUnsupportedError)
+	}
+
+	/// An anchor the cache cannot place is answered by re-enumerating from nothing, not by an
+	/// error the user sees. The working-set enumerator catches this case itself; the mapping is
+	/// here so an anchor handed to anything else still says the same thing.
+	func testAnExpiredSyncAnchorMapsToSyncAnchorExpired() {
+		assertFileProviderError(.SyncAnchorExpired("wrong database"), .syncAnchorExpired)
 	}
 
 	// MARK: - Totality
@@ -90,6 +130,7 @@ final class CacheErrorMappingTests: XCTestCase {
 			.Sql("x"), .Sdk("x"), .Conversion("x"), .Io("x"), .Remote("x"), .Image("x"),
 			.Unauthenticated("x"), .Disabled("x"), .DoesNotExist("x"), .Unsupported("x"),
 			.NotADirectory("x"), .FailedToDecrypt("x"), .InvalidName("x"),
+			.SyncAnchorExpired("x"),
 		]
 
 		for error in everyCase {

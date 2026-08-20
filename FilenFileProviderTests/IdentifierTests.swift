@@ -27,7 +27,8 @@ final class IdentifierTests: XCTestCase {
 			size: 0,
 			favoriteRank: 0,
 			localData: nil,
-			pendingUploadAt: nil)
+			pendingUploadAt: nil,
+			changeSeq: 0)
 	}
 
 	// MARK: - A1: trashed items must report their original container, not the drive root

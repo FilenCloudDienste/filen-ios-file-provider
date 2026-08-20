@@ -19,7 +19,7 @@ final class TransferProgressTests: XCTestCase {
 
 	func testConstructingANotifierMarksTheTransferInFlight() {
 		let set = makeSet()
-		let notifier = ProgressNotifier(set: set, uuid: uuid)
+		let notifier = ProgressNotifier(set: set, id: uuid)
 
 		XCTAssertTrue(contains(set, uuid))
 		_ = notifier
@@ -27,7 +27,7 @@ final class TransferProgressTests: XCTestCase {
 
 	func testReachingTheTotalEndsTheTransfer() {
 		let set = makeSet()
-		let notifier = ProgressNotifier(set: set, uuid: uuid)
+		let notifier = ProgressNotifier(set: set, id: uuid)
 		notifier.setTotal(size: 100)
 
 		notifier.onProgress(bytesProcessed: 60)
@@ -40,7 +40,7 @@ final class TransferProgressTests: XCTestCase {
 	func testReleasingANotifierAlwaysClearsTheTransfer() {
 		let set = makeSet()
 		do {
-			let notifier = ProgressNotifier(set: set, uuid: uuid)
+			let notifier = ProgressNotifier(set: set, id: uuid)
 			notifier.setTotal(size: 100)
 			notifier.onProgress(bytesProcessed: 10)
 			XCTAssertTrue(contains(set, uuid))
@@ -55,7 +55,7 @@ final class TransferProgressTests: XCTestCase {
 	/// immediately and the item stops showing as uploading while it is still uploading.
 	func testProgressBeforeTheTotalIsKnownDoesNotEndTheTransfer() {
 		let set = makeSet()
-		let notifier = ProgressNotifier(set: set, uuid: uuid)
+		let notifier = ProgressNotifier(set: set, id: uuid)
 
 		notifier.onProgress(bytesProcessed: 1)
 
@@ -67,7 +67,7 @@ final class TransferProgressTests: XCTestCase {
 	/// The same trap with a zero-byte callback: 0 >= 0 is true.
 	func testAZeroByteProgressBeforeTheTotalDoesNotEndTheTransfer() {
 		let set = makeSet()
-		let notifier = ProgressNotifier(set: set, uuid: uuid)
+		let notifier = ProgressNotifier(set: set, id: uuid)
 
 		notifier.onProgress(bytesProcessed: 0)
 
@@ -81,8 +81,8 @@ final class TransferProgressTests: XCTestCase {
 	/// complete blanks the indicator while bytes are still moving.
 	func testTheTransferStaysInFlightUntilEveryNotifierFinishes() {
 		let set = makeSet()
-		let first = ProgressNotifier(set: set, uuid: uuid)
-		let second = ProgressNotifier(set: set, uuid: uuid)
+		let first = ProgressNotifier(set: set, id: uuid)
+		let second = ProgressNotifier(set: set, id: uuid)
 		first.setTotal(size: 10)
 		second.setTotal(size: 1000)
 
@@ -97,9 +97,9 @@ final class TransferProgressTests: XCTestCase {
 	/// Releasing one notifier must not clear a slot another still holds.
 	func testReleasingOneOfTwoNotifiersLeavesTheTransferInFlight() {
 		let set = makeSet()
-		let survivor = ProgressNotifier(set: set, uuid: uuid)
+		let survivor = ProgressNotifier(set: set, id: uuid)
 		do {
-			let temporary = ProgressNotifier(set: set, uuid: uuid)
+			let temporary = ProgressNotifier(set: set, id: uuid)
 			temporary.setTotal(size: 10)
 		}
 
@@ -111,9 +111,9 @@ final class TransferProgressTests: XCTestCase {
 	/// or the count would go negative and drop somebody else's.
 	func testCompletingThenReleasingReleasesOnlyOnce() {
 		let set = makeSet()
-		let other = ProgressNotifier(set: set, uuid: uuid)
+		let other = ProgressNotifier(set: set, id: uuid)
 		do {
-			let finished = ProgressNotifier(set: set, uuid: uuid)
+			let finished = ProgressNotifier(set: set, id: uuid)
 			finished.setTotal(size: 10)
 			finished.onProgress(bytesProcessed: 10)
 		}
