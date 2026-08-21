@@ -147,6 +147,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	NSFileProviderThumbnailing
 {
 	private static let logger = Logger(subsystem: PROVIDER, category: "FileProvider")
+	/// Longest side we will ever ask the cache to produce, whatever the system
+	/// requests. See `fetchThumbnails` for why the request cannot be honoured
+	/// literally; 256 matches what other providers ship and is comfortably
+	/// above what any icon in Files.app actually draws.
+	private static let maxThumbnailPixels: CGFloat = 256
 	let state: FilenMobileCacheState
 	/// The domain's own manager. It owns the temporary directory downloaded content is staged
 	/// through, which has to be on the same volume as the replica for the system to clone from it.
@@ -1071,7 +1076,26 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			NSFileProviderItemIdentifier, Data?, Error?
 		) -> Void, completionHandler: @escaping (Error?) -> Void
 	) -> Progress {
-		Self.logger.debug("fetchThumbnails for \(itemIdentifiers.count) items")
+		// The system asks for 2048x2048 for EVERY item, on every device, no
+		// matter how small the icon it is about to draw: it caches one
+		// thumbnail per item version and rescales that one image for every
+		// use, so it requests the largest size it might ever want. The size is
+		// an upper bound, not a demand — QuickLook documents the sibling API's
+		// size as a maximum and downscales to fit, Apple's own WWDC sample
+		// ignores the parameter outright, and ownCloud's provider clamps it to
+		// 256 exactly like this.
+		//
+		// We must clamp, because this extension is strictly memory bound: a
+		// file provider gets roughly 20 MB before jetsam kills it, and a
+		// 2048x2048 RGBA buffer is 16 MB on its own — honouring the request
+		// literally is not possible, let alone the decode that produces it.
+		// Asking the Rust pipeline for 2048 made it refuse nearly every real
+		// photo as over-budget, and the system caches that refusal until the
+		// item's contentVersion changes, so the thumbnails never came back.
+		let requested = min(max(size.width, size.height), Self.maxThumbnailPixels)
+		Self.logger.debug(
+			"fetchThumbnails for \(itemIdentifiers.count) items at \(size.width)x\(size.height), serving \(requested)"
+		)
 		let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
 		// This call has a real cancellation hook — the Rust thumbnail task takes one — but the
 		// framework still wants the completion answered from the cancellation handler, and the
@@ -1089,8 +1113,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			progress: progress)
 		do {
 			let thumbnailTask = try self.state.getThumbnails(
-				items: itemIdentifiers.map { $0.rawValue }, requestedWidth: UInt32(size.width),
-				requestedHeight: UInt32(size.height), callback: fetchHandler)
+				items: itemIdentifiers.map { $0.rawValue }, requestedWidth: UInt32(requested),
+				requestedHeight: UInt32(requested), callback: fetchHandler)
 			// In the registry as well as on the progress: `invalidate()` cancels through
 			// `cancelAll` only, so without this the one call with a real Rust-side cancel was
 			// the one teardown could not stop.
