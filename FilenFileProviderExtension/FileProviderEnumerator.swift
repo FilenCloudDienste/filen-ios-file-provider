@@ -101,6 +101,9 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 		}
 	}
 
+	/// Changes per page when the system does not suggest a batch size of its own.
+	private static let changeBatchSize = 500
+
 	/// The diff, served on the extension's registry so `invalidate()` can drop it: an observer
 	/// belonging to a discarded instance must not be called afterwards. The refresh below takes no
 	/// abort signal — only the three byte-moving calls do — so cancelling only abandons it: it
@@ -124,7 +127,16 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 			}
 
 			do {
-				let changes = try self.state.enumerateChanges(anchor: anchor.rawValue)
+				// Paged: a bulk change (a big delete, a first listing of a huge folder) must not
+				// arrive as one giant diff that a delivery failure would retry forever. A full
+				// page reports its own anchor with `moreComing`, so every delivered page advances
+				// the system's anchor durably and a killed enumeration resumes where it stopped.
+				let suggested = (observer.suggestedBatchSize ?? nil) ?? Self.changeBatchSize
+				// 0 means "unbounded" to the cache, which is exactly the wedge paging exists to
+				// prevent — never pass it.
+				let batchSize = UInt32(clamping: suggested > 0 ? suggested : Self.changeBatchSize)
+				let changes = try self.state.enumerateChangesPage(
+					anchor: anchor.rawValue, limit: batchSize)
 				let updated = changes.updated.compactMap(self.item(for:))
 				let deleted = changes.deletedIds.map { NSFileProviderItemIdentifier($0) }
 				// The diff delivered everything up to its anchor, so that anchor is paired with

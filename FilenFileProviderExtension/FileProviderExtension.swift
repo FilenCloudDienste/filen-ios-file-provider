@@ -143,6 +143,38 @@ final class WorkingSetSignaller: WorkingSetUpdateListener, @unchecked Sendable {
 	}
 }
 
+/// Collects one page of an enumeration into an array, resuming a continuation with the items and
+/// the page to continue from. Drives `enumeratorForMaterializedItems` (see
+/// `reportMaterializedContainers`); the system delivers a page's callbacks serially, which is
+/// what makes the bare `var` safe.
+private final class MaterializedPageObserver: NSObject, NSFileProviderEnumerationObserver,
+	@unchecked Sendable
+{
+	private let continuation:
+		CheckedContinuation<(items: [NSFileProviderItem], next: NSFileProviderPage?), Error>
+	private var items: [NSFileProviderItem] = []
+
+	init(
+		continuation: CheckedContinuation<
+			(items: [NSFileProviderItem], next: NSFileProviderPage?), Error
+		>
+	) {
+		self.continuation = continuation
+	}
+
+	func didEnumerate(_ updatedItems: [NSFileProviderItem]) {
+		self.items.append(contentsOf: updatedItems)
+	}
+
+	func finishEnumerating(upTo nextPage: NSFileProviderPage?) {
+		self.continuation.resume(returning: (self.items, nextPage))
+	}
+
+	func finishEnumeratingWithError(_ error: Error) {
+		self.continuation.resume(throwing: error)
+	}
+}
+
 final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	NSFileProviderThumbnailing
 {
@@ -160,6 +192,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	// same locking as the two sets underneath it, not a bare var.
 	private let cachedRootUuid = OSAllocatedUnfairLock<String?>(initialState: nil)
 	private let inFlight = InFlightWork()
+	/// The debounced re-drain `materializedItemsDidChange` schedules; replaced (and the old one
+	/// cancelled) on every callback, so a burst coalesces into one drain.
+	private let materializedRedrain = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
 	/// Attempts for a content upload before the edit is given up on. Three with exponential
 	/// backoff covers a transient blip without keeping a suspended-at-any-moment extension busy.
 	static let uploadAttempts = 3
@@ -402,16 +437,90 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 				Self.logger.error("Draining pending uploads failed: \(error)")
 			}
 		}
+
+		// Report the containers the system holds materialized — the directories it will never
+		// re-enumerate on its own, whose contents the cache's live path is therefore responsible
+		// for keeping fresh through the working set. Fire-and-forget for the same reason as the
+		// drain above; failures keep the cache's last-known (persisted) set.
+		self.inFlight.run(Progress()) { [weak self] in
+			await self?.reportMaterializedContainers()
+		}
 	}
 
 	func invalidate() {
 		self.inFlight.cancelAll()
-		// The registrations belong to this instance's cache state; a discarded extension must not
-		// leave them holding a socket subscription. The next instance rebuilds the whole set from
-		// the database on its first refresh, so nothing is lost. The listener goes with them —
-		// its manager belongs to this instance too.
-		self.state.stopWorkingSetTracking()
+		self.materializedRedrain.withLock { pending in
+			pending?.cancel()
+			pending = nil
+		}
+		// A discarded extension must not leave its socket subscription applying in the
+		// background; the next instance's auth brings the live path back up and rebuilds
+		// everything from the database, so nothing is lost. The listener goes too — its manager
+		// belongs to this instance.
+		self.state.stopLiveUpdates()
 		self.state.setWorkingSetListener(listener: nil)
+	}
+
+	// MARK: - Materialized set
+
+	/// Drains `enumeratorForMaterializedItems` and hands the cache the set of materialized
+	/// CONTAINERS. Filtered to folders here: the materialized set holds every downloaded FILE
+	/// too, and each unknown id costs the cache a guaranteed-404 `get_dir` probe on the
+	/// post-wipe path. Wholesale replace on the Rust side, so this is idempotent and a missed
+	/// callback self-heals on the next drain. A failed page aborts WITHOUT reporting — a partial
+	/// set would silently drop containers from freshness; the cache keeps its last-known set.
+	private func reportMaterializedContainers() async {
+		guard let manager = self.manager else { return }
+		let enumerator = manager.enumeratorForMaterializedItems()
+		var containers: [String] = []
+		var page: NSFileProviderPage? = NSFileProviderPage(rawValue: Data())
+		while let current = page {
+			let result: (items: [NSFileProviderItem], next: NSFileProviderPage?)
+			do {
+				result = try await withCheckedThrowingContinuation { continuation in
+					enumerator.enumerateItems(
+						for: MaterializedPageObserver(continuation: continuation),
+						startingAt: current)
+				}
+			} catch {
+				Self.logger.error("draining the materialized set failed: \(error)")
+				return
+			}
+			for item in result.items {
+				let identifier = item.itemIdentifier
+				// The sentinels are not containers of ours; the root is injected by the cache
+				// unconditionally.
+				guard identifier != .rootContainer, identifier != .trashContainer,
+					identifier != .workingSet
+				else { continue }
+				guard (item.contentType ?? nil) == .folder else { continue }
+				containers.append(identifier.rawValue)
+			}
+			page = result.next
+		}
+		do {
+			try await self.state.setMaterializedContainers(ids: containers)
+			Self.logger.info("reported \(containers.count) materialized container(s)")
+		} catch {
+			Self.logger.error("reporting the materialized containers failed: \(error)")
+		}
+	}
+
+	/// The system's cue that its materialized set moved, in either direction. Answered
+	/// immediately and acted on as a debounced timed task, exactly as the header prescribes
+	/// ("set a flag and perform any resulting work as a timed task"); the work is always a full
+	/// re-drain + wholesale replace — idempotent, one code path, self-healing.
+	func materializedItemsDidChange(completionHandler: @escaping () -> Void) {
+		completionHandler()
+		let task = Task { [weak self] in
+			try? await Task.sleep(nanoseconds: 2_000_000_000)
+			guard !Task.isCancelled else { return }
+			await self?.reportMaterializedContainers()
+		}
+		self.materializedRedrain.withLock { pending in
+			pending?.cancel()
+			pending = task
+		}
 	}
 
 	// MARK: - Reading items
