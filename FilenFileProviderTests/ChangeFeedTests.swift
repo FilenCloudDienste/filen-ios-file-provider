@@ -282,6 +282,25 @@ final class ChangeFeedTests: XCTestCase {
 		var count: Int { lock.withLock { signals } }
 	}
 
+	/// A second cache over the same account, standing in for another device.
+	///
+	/// Needed because the working-set signal is gated on the change stamp actually moving
+	/// (`live::notify_if_changed` on the Rust side): a change THIS cache made is already in its
+	/// database before the socket echoes it back, so the echo upserts identical values, the stamp
+	/// stands still, and no signal is due. Only a change from elsewhere proves the loop — and it
+	/// is the only kind the signal exists for.
+	private func makeOtherDevice() throws -> FilenMobileCacheState {
+		let credentials = try XCTUnwrap(TestAuth.credentialsFromEnvironment())
+		let deviceDir = workDir.appending(component: "other-device")
+		try FileManager.default.createDirectory(at: deviceDir, withIntermediateDirectories: true)
+		let authFile = deviceDir.appending(component: "auth.json")
+		let dek = try TestAuth.provision(authFile: authFile, credentials: credentials)
+		return FilenMobileCacheState(
+			filesDir: deviceDir.path(percentEncoded: false),
+			authFile: authFile.path(percentEncoded: false),
+			dek: dek)
+	}
+
 	/// The live path end to end from Swift: a change made on the drive comes back through the
 	/// cache's own socket subscription rather than through anybody asking, and the listener is
 	/// what says so.
@@ -300,21 +319,24 @@ final class ChangeFeedTests: XCTestCase {
 		state.startLiveUpdates()
 		state.startLiveUpdates()
 
-		// A drive change to a held file. Nothing here asks the cache about the item: the only
-		// path from the change to the signal is the socket subscription and the applier.
+		// A drive change made by ANOTHER device, under a directory this cache holds. Nothing here
+		// asks the cache about the item: the only path from the change to the signal is the socket
+		// subscription and the applier.
 		//
 		// Repeated because the socket connects asynchronously behind the subscription, and an
 		// event emitted before the connection is up is never redelivered. Each pass is a real
 		// drive change whose echo comes back over the socket, so the first signal proves the
 		// loop end to end.
+		let otherDevice = try makeOtherDevice()
 		for attempt in 0..<10 where signals.count == 0 {
-			_ = try await state.setFavoriteRank(
-				item: identifier, favoriteRank: attempt % 2 == 0 ? 0 : 1)
+			_ = try await otherDevice.createDir(
+				parentPath: dir.id, name: "probe-\(attempt)", created: nil)
 			let deadline = Date().addingTimeInterval(6)
 			while signals.count == 0 && Date() < deadline {
 				try await Task.sleep(nanoseconds: 250_000_000)
 			}
 		}
+		otherDevice.stopLiveUpdates()
 		XCTAssertGreaterThan(
 			signals.count, 0,
 			"a drive change has to reach the replica without it having asked")

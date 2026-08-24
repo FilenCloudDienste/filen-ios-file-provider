@@ -125,7 +125,30 @@ final class InFlightWork: Sendable {
 /// correctness, so it is logged and dropped.
 final class WorkingSetSignaller: WorkingSetUpdateListener, @unchecked Sendable {
 	private static let logger = Logger(subsystem: PROVIDER, category: "FileProvider")
+	/// How long after a signal further changes ride the same window. Every signal costs the
+	/// system an `enumerateChanges` round trip, and a burst — a bulk upload landing on another
+	/// device, one socket event per file — is ONE thing to tell it about, not fifty.
+	private static let coalesceDelay: UInt64 = 2_000_000_000
 	private let manager: NSFileProviderManager?
+	private enum Window {
+		case closed
+		case open
+		case openWithJoiners
+	}
+	/// Where the suppression window stands. Signalling is leading-edge: the common case is one
+	/// isolated change after a quiet period, and making it sit out the window is pure added
+	/// latency — worse, a wait the extension does not survive loses the signal outright, because
+	/// the watermark advanced at apply time and the relaunch gap-check sees no gap to re-signal.
+	/// So the first change signals immediately and opens the window; a change that lands while
+	/// it is open JOINS it instead of replacing it — the cancel-and-reschedule shape
+	/// `materializedItemsDidChange` uses is fine for a callback stream that ends, but here it
+	/// would starve: a steady event stream never pauses long enough for the delay to elapse, and
+	/// the system would learn nothing until the stream stopped. A window that closes with
+	/// joiners in it signals once more and stays open, so a stream is reported once per window;
+	/// every transition happens before the send it decides on is awaited, so a change landing
+	/// during a send either marks a window that is still open — which flushes it — or finds the
+	/// window closed and opens its own. Neither path can drop it.
+	private let window = OSAllocatedUnfairLock<Window>(initialState: .closed)
 
 	init(manager: NSFileProviderManager?) {
 		self.manager = manager
@@ -133,12 +156,44 @@ final class WorkingSetSignaller: WorkingSetUpdateListener, @unchecked Sendable {
 
 	func workingSetChanged() {
 		guard let manager = self.manager else { return }
-		Task {
-			do {
-				try await manager.signalEnumerator(for: .workingSet)
-			} catch {
-				Self.logger.error("signalling the working set failed: \(error)")
+		let opened = self.window.withLock { window -> Bool in
+			switch window {
+			case .closed:
+				window = .open
+				return true
+			case .open:
+				window = .openWithJoiners
+				return false
+			case .openWithJoiners:
+				return false
 			}
+		}
+		guard opened else { return }
+		Task {
+			await Self.signal(manager)
+			while true {
+				try? await Task.sleep(nanoseconds: Self.coalesceDelay)
+				let joined = self.window.withLock { window -> Bool in
+					switch window {
+					case .openWithJoiners:
+						window = .open
+						return true
+					case .open, .closed:
+						window = .closed
+						return false
+					}
+				}
+				guard joined else { return }
+				await Self.signal(manager)
+			}
+		}
+	}
+
+	private static func signal(_ manager: NSFileProviderManager) async {
+		do {
+			try await manager.signalEnumerator(for: .workingSet)
+		} catch {
+			Self.logger.error("signalling the working set failed: \(error)")
 		}
 	}
 }
