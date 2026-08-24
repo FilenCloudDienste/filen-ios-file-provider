@@ -120,8 +120,13 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 			// Best effort, and deliberately unchecked: the anchor is a purely local watermark, so
 			// a refresh that fails (offline, server down) must still serve the diff the cache
 			// already holds rather than failing the whole enumeration.
+			//
+			// `…IfStale`, because this runs once per PAGE and the diff does not read what it
+			// refreshes: the working-set predicate and the change feed key off the change
+			// sequence, never the recents flag. A full listing plus a decrypt of every item, per
+			// page of one enumeration, bought nothing.
 			do {
-				try await self.state.updateRecents()
+				try await self.state.updateRecentsIfStale()
 			} catch {
 				Self.logger.error("working-set refresh failed, serving the local diff: \(error)")
 			}
@@ -222,7 +227,11 @@ class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 	/// miss and surface as "no such item" in the Files app's Recently Deleted view.
 	private func enumerateTrash(for observer: any NSFileProviderEnumerationObserver) async {
 		do {
-			try await self.state.updateTrash()
+			// `…IfStale`: presenting the trash paid a full listing plus up to 64 per-row probes
+			// every time. Changes the user makes here go through the cache and are already in the
+			// rows `queryTrash` reads; a remote empty-trash arrives over the socket, which relists
+			// unthrottled.
+			try await self.state.updateTrashIfStale()
 			let response = try self.state.queryTrash(orderBy: nil)
 			let items = response.objects.map {
 				FileProviderItem(parentItemIdentifier: .trashContainer, object: $0)
