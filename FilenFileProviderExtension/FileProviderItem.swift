@@ -186,26 +186,39 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		if self.identifier.rawValue.starts(with: TRASH_CACHE_ID + "/") { return true }
 		return objectIsTrashed(self.object)
 	}
+
+	private static func date(_ millis: Int64) -> Date {
+		Date(timeIntervalSince1970: TimeInterval(millis) / 1000)
+	}
+
+	/// When the server minted the item's row: the one date the drive always knows, because it
+	/// sits outside the encrypted metadata. Both dates below fall back to it — metadata that
+	/// will not decrypt, or that was written without dates of its own, otherwise leaves the item
+	/// dateless, which the Files app shows as "--" and sorts below everything that has a date.
+	private var remoteTimestamp: Date? {
+		switch self.object {
+		case .file(let ffiFile): return Self.date(ffiFile.timestamp)
+		case .dir(let ffiDir): return Self.date(ffiDir.timestamp)
+		case .root(_): return nil
+		}
+	}
+
 	var contentModificationDate: Date? {
 		switch self.object {
 		case .file(let ffiFile):
-			guard let modified = ffiFile.meta?.modified else { return nil }
-			return Date(timeIntervalSince1970: TimeInterval(modified) / 1000)
-		case .dir(let dir):
-			guard let created = dir.meta?.created else { return nil }
-			return Date(timeIntervalSince1970: TimeInterval(created) / 1000)
+			return (ffiFile.meta?.modified).map(Self.date) ?? self.remoteTimestamp
+		case .dir(let ffiDir):
+			// A directory has no modification date of its own; its creation date is the closest
+			// thing, and the row timestamp behind that.
+			return (ffiDir.meta?.created).map(Self.date) ?? self.remoteTimestamp
 		case .root(_): return nil
 		}
 	}
 
 	var creationDate: Date? {
 		switch self.object {
-		case .file(let ffiFile):
-			guard let created = ffiFile.meta?.created else { return nil }
-			return Date(timeIntervalSince1970: TimeInterval(created) / 1000)
-		case .dir(let dir):
-			guard let created = dir.meta?.created else { return nil }
-			return Date(timeIntervalSince1970: TimeInterval(created) / 1000)
+		case .file(let file): return (file.meta?.created).map(Self.date) ?? self.remoteTimestamp
+		case .dir(let dir): return (dir.meta?.created).map(Self.date) ?? self.remoteTimestamp
 		case .root(_): return nil
 		}
 	}
@@ -240,10 +253,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	/// The drive has no last-used date, so the one the system sets is kept locally and handed
 	/// straight back — the system's cue for the Recents view.
 	var lastUsedDate: Date? {
-		guard let millis = self.localData?[LOCAL_DATA_LAST_USED].flatMap(Int64.init) else {
-			return nil
-		}
-		return Date(timeIntervalSince1970: TimeInterval(millis) / 1000)
+		self.localData?[LOCAL_DATA_LAST_USED].flatMap(Int64.init).map(Self.date)
 	}
 
 	// Transfers are keyed by the item's whole-life identifier rather than its uuid: a file's uuid

@@ -26,6 +26,7 @@ final class IdentifierTests: XCTestCase {
 			meta: nil,
 			size: 0,
 			favoriteRank: 0,
+			timestamp: 0,
 			localData: nil,
 			pendingUploadAt: nil,
 			changeSeq: 0)

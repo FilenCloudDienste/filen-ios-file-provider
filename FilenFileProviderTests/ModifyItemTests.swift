@@ -26,8 +26,8 @@ final class ModifyItemTests: XCTestCase {
 			originalParent: nil,
 			meta: FfiFileMeta(
 				name: name, mime: "application/pdf", created: 0, modified: 0, hash: nil),
-			size: 0, favoriteRank: favoriteRank, localData: localData, pendingUploadAt: nil,
-			changeSeq: 0)
+			size: 0, favoriteRank: favoriteRank, timestamp: 0, localData: localData,
+			pendingUploadAt: nil, changeSeq: 0)
 		return FileProviderItem(
 			itemIdentifier: NSFileProviderItemIdentifier("stable/" + Self.stableUuid),
 			object: .file(file), parentItemIdentifier: parent)

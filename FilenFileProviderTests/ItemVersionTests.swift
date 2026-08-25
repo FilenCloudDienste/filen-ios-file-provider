@@ -28,6 +28,7 @@ final class ItemVersionTests: XCTestCase {
 				modified: 1_700_000_000, hash: nil),
 			size: size,
 			favoriteRank: 0,
+			timestamp: 1_500_000_000,
 			localData: nil,
 			pendingUploadAt: nil,
 			changeSeq: changeSeq)
@@ -44,6 +45,7 @@ final class ItemVersionTests: XCTestCase {
 			meta: FfiDirMeta(name: name, created: 1_600_000_000),
 			color: nil,
 			favoriteRank: 0,
+			timestamp: 1_500_000_000,
 			lastListed: 0,
 			localData: nil,
 			changeSeq: changeSeq)

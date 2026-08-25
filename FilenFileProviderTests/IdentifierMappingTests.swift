@@ -19,14 +19,15 @@ final class IdentifierMappingTests: XCTestCase {
 			FfiFile(
 				uuid: Self.fileUuid, stableUuid: Self.fileStableUuid, parent: parent,
 				originalParent: originalParent, meta: nil, size: 0, favoriteRank: 0,
-				localData: nil, pendingUploadAt: nil, changeSeq: 0))
+				timestamp: 0, localData: nil, pendingUploadAt: nil, changeSeq: 0))
 	}
 
 	private func dir(parent: String = parentUuid, originalParent: String? = nil) -> FfiObject {
 		.dir(
 			FfiDir(
 				uuid: Self.dirUuid, parent: parent, originalParent: originalParent, meta: nil,
-				color: nil, favoriteRank: 0, lastListed: 0, localData: nil, changeSeq: 0))
+				color: nil, favoriteRank: 0, timestamp: 0, lastListed: 0, localData: nil,
+				changeSeq: 0))
 	}
 
 	private func root() -> FfiObject {
