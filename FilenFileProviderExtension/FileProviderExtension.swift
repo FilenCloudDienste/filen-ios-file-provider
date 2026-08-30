@@ -1,3 +1,4 @@
+import CryptoKit
 import FileProvider
 import Foundation
 import Security
@@ -239,7 +240,171 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	/// literally; 256 matches what other providers ship and is comfortably
 	/// above what any icon in Files.app actually draws.
 	private static let maxThumbnailPixels: CGFloat = 256
+
+	/// The cache state deliberately outlives the extension instance that built it.
+	///
+	/// `FilenMobileCacheState` owns the SQLite connection, and releasing the last reference runs a
+	/// full WAL checkpoint AND unlink while holding SQLITE_LOCK_EXCLUSIVE — the most lock-intensive
+	/// moment in a WAL database's life. The system deallocates provider instances whenever it
+	/// likes, including as it suspends the process, so an instance owning the only reference puts
+	/// that close exactly where iOS kills a process for holding a database lock during suspension
+	/// (RUNNINGBOARD 0xdead10cc). Holding it here makes a discarded instance free, and leaves the
+	/// connection closed only deliberately — below, while the extension is awake and inside an
+	/// activity assertion. Letting the process exit without closing at all is safe: a live WAL is
+	/// exactly what the next open recovers from.
+	///
+	/// Keyed by domain AND by the identity of the credentials the state was built from: reusing a
+	/// cache across a logout would serve the previous account's tree, and the owner check the Rust
+	/// layer runs while constructing cannot catch that once construction is what we are skipping.
+	private struct RetainedCacheState {
+		let authIdentity: Data
+		let state: FilenMobileCacheState
+	}
+
+	private static let retainedState = OSAllocatedUnfairLock<[String: RetainedCacheState]>(
+		initialState: [:])
+
+	/// Newest instance id seen per domain. `invalidate()` compares against it rather than assuming
+	/// the instance being torn down is still the one whose listener is installed.
+	private static let newestInstance = OSAllocatedUnfairLock<[String: UInt64]>(initialState: [:])
+
+	private static func claimInstanceId(domainKey: String) -> UInt64 {
+		Self.newestInstance.withLock { map -> UInt64 in
+			let next = (map[domainKey] ?? 0) + 1
+
+			map[domainKey] = next
+
+			return next
+		}
+	}
+
+	private func isNewestInstance() -> Bool {
+		Self.newestInstance.withLock { $0[self.domainKey] == self.instanceId }
+	}
+
+	/// Whether `invalidate()` should tear the live path down on the state this instance holds.
+	///
+	/// Skip in exactly one case: the registry still holds THIS state and a newer instance has taken
+	/// it over — detaching then would null the listener the successor installed. Recency alone is
+	/// not enough. When the registry has moved on to a different state, the one held here is
+	/// displaced, no successor is using it, and nothing else will ever stop its socket applying
+	/// events, so it has to be torn down here.
+	private func shouldDetachLiveState() -> Bool {
+		let stateIsCurrent = Self.retainedState.withLock { map -> Bool in
+			guard let entry = map[self.domainKey] else {
+				return false
+			}
+
+			return entry.state === self.state
+		}
+
+		return !stateIsCurrent || self.isNewestInstance()
+	}
+
+	/// Drops the state retained for `domainKey`, closing its database connection if this was the
+	/// last reference to it. Separate function so the release happens when it returns rather than
+	/// at the end of a longer scope.
+	private static func releaseRetainedState(domainKey: String) {
+		let displaced = Self.retainedState.withLock { map -> RetainedCacheState? in
+			let previous = map[domainKey]
+
+			map[domainKey] = nil
+
+			return previous
+		}
+
+		withExtendedLifetime(displaced) {}
+	}
+
+	/// Fingerprints the credentials a state was built from, so a logout — or a swap to another
+	/// account — is never mistaken for the same session. Hashed rather than kept, so no auth
+	/// material sits in a process-global for the lifetime of the extension.
+	private static func authIdentity(authFile: String, dek: Data) -> Data {
+		var hasher = SHA256()
+
+		// A missing auth.json contributes nothing, so it hashes the same as an empty one. Both are
+		// the unauthenticated state and the Rust side fails closed on either, so collapsing them
+		// is deliberate rather than a gap.
+		if let contents = FileManager.default.contents(atPath: authFile) {
+			hasher.update(data: contents)
+		}
+
+		hasher.update(data: dek)
+
+		return Data(hasher.finalize())
+	}
+
+	/// The retained state for `domainKey`, building one when there is none or when the credentials
+	/// have changed since the retained one was built.
+	private static func cacheState(
+		domainKey: String, authIdentity: Data, build: () -> FilenMobileCacheState
+	) -> FilenMobileCacheState {
+		let reused = Self.retainedState.withLock { map -> FilenMobileCacheState? in
+			guard let entry = map[domainKey], entry.authIdentity == authIdentity else {
+				return nil
+			}
+
+			return entry.state
+		}
+
+		if let reused {
+			return reused
+		}
+
+		// Drop any stale state BEFORE building, not after. Reaching here means there is nothing
+		// reusable — either nothing retained at all, or the credentials changed. In that second
+		// case the build runs the Rust re-init, which wipes the database, and that wipe
+		// requires no open connection to it ("Callers must hold no open connection to either DB",
+		// io::wipe_account_data). A connection kept open across it would be closed later and unlink
+		// the -wal/-shm sidecars BY PATHNAME, taking the fresh connection's live ones with them.
+		// Releasing here also means no reader can be handed a state that is about to close. The
+		// caller's activity assertion still covers this, so the close is not exposed to suspension.
+		//
+		// Only the registry's reference is dropped. Others can outlive it — an instance that has
+		// not deallocated, an enumerator the system still holds, the launch-time drain that cannot
+		// be cancelled — and the close waits for the last of them. That is no worse than before
+		// this registry existed, and it is why a credential change is best made while nothing is
+		// serving the domain.
+		Self.releaseRetainedState(domainKey: domainKey)
+
+		// Built outside the lock because it opens a database. Two constructions racing would each
+		// build one and the loser would be retained only by its own instance — the system does not
+		// construct concurrent instances for a single domain in practice.
+		let fresh = build()
+
+		Self.retainedState.withLock { map in
+			map[domainKey] = RetainedCacheState(authIdentity: authIdentity, state: fresh)
+		}
+
+		return fresh
+	}
+
+	/// Runs `work` inside a `ProcessInfo` activity. Apple names this as the remedy for 0xdead10cc
+	/// in an app extension: it marks a window the process should not be suspended in the middle of.
+	/// Everything that can open, write or close the database runs inside one.
+	private static func withActivity<T>(_ reason: String, _ work: () throws -> T) rethrows -> T {
+		let token = ProcessInfo.processInfo.beginActivity(options: .background, reason: reason)
+
+		defer { ProcessInfo.processInfo.endActivity(token) }
+
+		return try work()
+	}
+
+	/// Async counterpart of `withActivity`, for the work started at launch.
+	private static func withAsyncActivity<T>(
+		_ reason: String, _ work: () async throws -> T
+	) async rethrows -> T {
+		let token = ProcessInfo.processInfo.beginActivity(options: .background, reason: reason)
+
+		defer { ProcessInfo.processInfo.endActivity(token) }
+
+		return try await work()
+	}
 	let state: FilenMobileCacheState
+	private let domainKey: String
+	/// Distinguishes this instance from the one that replaces it. The cache state is now shared,
+	/// and the system does not order `invalidate()` against the next `init` — see `invalidate()`.
+	private let instanceId: UInt64
 	/// The domain's own manager. It owns the temporary directory downloaded content is staged
 	/// through, which has to be on the same volume as the replica for the system to clone from it.
 	private let manager: NSFileProviderManager?
@@ -407,17 +572,25 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
 	required init(domain: NSFileProviderDomain) {
 		let manager = NSFileProviderManager(for: domain)
+		let domainKey = domain.identifier.rawValue
+
 		self.manager = manager
+		self.domainKey = domainKey
+		self.instanceId = Self.claimInstanceId(domainKey: domainKey)
 		let authFile =
 			FileManager.default.containerURL(
 				forSecurityApplicationGroupIdentifier: "group.io.filen.app")?.appending(
 					component: "auth.json"
 				).path(percentEncoded: false) ?? ""
 		// The SQLite files (native_cache.db, db_state.json, SDK search DB) live in the
-		// EXTENSION'S private container, not in documentStorage: documentStorage sits inside
-		// the shared app-group container, and iOS kills a process that is suspended while
-		// holding a file/SQLite lock there (RUNNINGBOARD 0xdead10cc) — both DBs are WAL, which
-		// holds a lock even while idle. Content files stay under the app group. DB files an
+		// EXTENSION'S private container, not in documentStorage, which sits inside the shared
+		// app-group container. This is NOT what stops the RUNNINGBOARD 0xdead10cc kills, though
+		// it was written believing so: Apple scopes that termination to holding a file or SQLite
+		// lock during suspension WITHOUT qualifying it by container, the shared-container reading
+		// is community lore, and the kills continued after this move. They come from the
+		// connection being closed as the process suspends — see `retainedState`. One owner and
+		// one WAL is still worth having, just not for that reason. Content files stay under the
+		// app group. DB files an
 		// earlier build left elsewhere are deliberately abandoned (nothing opens those paths
 		// again); the fresh location reinitializes and re-syncs the cache once. Failure to
 		// create the dir here is non-fatal by design — the Rust side create_dir_all's it again.
@@ -462,11 +635,25 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		let filesDir =
 			groupContainer?.appending(component: "File Provider Storage")
 			?? FileManager.default.temporaryDirectory.appending(component: "File Provider Storage")
-		self.state = FilenMobileCacheState.newWithDbDir(
-			filesDir: filesDir.path(percentEncoded: false),
-			dbDir: dbDir.path(percentEncoded: false),
-			authFile: authFile,
-			dek: Self.loadAuthDek())
+		let dek = Self.loadAuthDek()
+		let filesDirPath = filesDir.path(percentEncoded: false)
+		let dbDirPath = dbDir.path(percentEncoded: false)
+
+		// Opening the database, and closing any state displaced by a credential change, both take
+		// database locks — so both happen inside an activity assertion rather than wherever the
+		// system happened to schedule this instance.
+		self.state = Self.withActivity("open the file provider cache") {
+			Self.cacheState(
+				domainKey: domainKey,
+				authIdentity: Self.authIdentity(authFile: authFile, dek: dek)
+			) {
+				FilenMobileCacheState.newWithDbDir(
+					filesDir: filesDirPath,
+					dbDir: dbDirPath,
+					authFile: authFile,
+					dek: dek)
+			}
+		}
 
 		super.init()
 
@@ -480,16 +667,18 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// slow drain must not delay the first operation the system asks for, hence no await.
 		let state = self.state
 		self.inFlight.run(Progress()) {
-			do {
-				let uploaded = try await state.retryPendingUploads()
-				if uploaded > 0 {
-					Self.logger.info("Recovered \(uploaded) pending upload(s) on launch")
-					// The recovered versions are new to the system: the working set is how a
-					// replicated provider says so.
-					try await manager?.signalEnumerator(for: .workingSet)
+			await Self.withAsyncActivity("drain pending uploads") {
+				do {
+					let uploaded = try await state.retryPendingUploads()
+					if uploaded > 0 {
+						Self.logger.info("Recovered \(uploaded) pending upload(s) on launch")
+						// The recovered versions are new to the system: the working set is how a
+						// replicated provider says so.
+						try await manager?.signalEnumerator(for: .workingSet)
+					}
+				} catch {
+					Self.logger.error("Draining pending uploads failed: \(error)")
 				}
-			} catch {
-				Self.logger.error("Draining pending uploads failed: \(error)")
 			}
 		}
 
@@ -498,7 +687,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// for keeping fresh through the working set. Fire-and-forget for the same reason as the
 		// drain above; failures keep the cache's last-known (persisted) set.
 		self.inFlight.run(Progress()) { [weak self] in
-			await self?.reportMaterializedContainers()
+			await Self.withAsyncActivity("report materialized containers") {
+				await self?.reportMaterializedContainers()
+			}
 		}
 	}
 
@@ -512,6 +703,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// background; the next instance's auth brings the live path back up and rebuilds
 		// everything from the database, so nothing is lost. The listener goes too — its manager
 		// belongs to this instance.
+		//
+		// Unless a newer instance has already taken this state over: it is shared now, and the
+		// system does not order this against the next init. A late invalidate() would otherwise
+		// null the listener the SUCCESSOR installed, and nothing re-sets it until yet another
+		// instance is created — the working set would go quiet for the rest of that instance's life.
+		guard self.shouldDetachLiveState() else {
+			return
+		}
+
 		self.state.stopLiveUpdates()
 		self.state.setWorkingSetListener(listener: nil)
 	}
