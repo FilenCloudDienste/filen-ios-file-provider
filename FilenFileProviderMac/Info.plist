@@ -16,12 +16,72 @@
 	<string>6.0</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER).decoration.keepDownloaded</string>
+			<key>UTTypeDescription</key>
+			<string>Kept downloaded</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.icon-decoration.badge</string>
+			</array>
+			<key>UTTypeIconFile</key>
+			<string>KeepDownloaded.icns</string>
+		</dict>
+	</array>
 	<key>NSExtension</key>
 	<dict>
+		<key>NSExtensionFileProviderActions</key>
+		<array>
+			<dict>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>io.filen.fileprovider.action.keepDownloaded</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Keep Downloaded</string>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>SUBQUERY(fileproviderItems, $item, $item.userInfo.pinnable == true AND NOT ('pinned.inherited' IN $item.resolvedUserInfo.@allKeys)).@count &gt; 0</string>
+			</dict>
+			<dict>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>io.filen.fileprovider.action.stopKeepingDownloaded</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Don’t Keep Downloaded</string>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>SUBQUERY(fileproviderItems, $item, 'pinned.inherited' IN $item.userInfo.@allKeys).@count &gt; 0</string>
+			</dict>
+			<dict>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>io.filen.fileprovider.action.removeDownload</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Remove Download</string>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>SUBQUERY(fileproviderItems, $item, $item.isDownloaded == true AND NOT ('pinned.inherited' IN $item.inheritedUserInfo.@allKeys)).@count &gt; 0</string>
+			</dict>
+		</array>
+		<key>NSExtensionFileProviderAllowsUserControlledEviction</key>
+		<false/>
 		<key>NSExtensionFileProviderDocumentGroup</key>
 		<string>7YTW5D2K7P.io.filen.desktop</string>
 		<key>NSExtensionFileProviderSupportsEnumeration</key>
 		<true/>
+		<key>NSFileProviderDecorations</key>
+		<array>
+			<dict>
+				<key>Identifier</key>
+				<string>$(PRODUCT_BUNDLE_IDENTIFIER).keepDownloaded</string>
+				<key>BadgeImageType</key>
+				<string>$(PRODUCT_BUNDLE_IDENTIFIER).decoration.keepDownloaded</string>
+				<key>Category</key>
+				<string>Badge</string>
+				<key>Label</key>
+				<dict>
+					<key>NSStringFormat</key>
+					<string>Kept downloaded</string>
+				</dict>
+			</dict>
+		</array>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.fileprovider-nonui</string>
 		<key>NSExtensionPrincipalClass</key>

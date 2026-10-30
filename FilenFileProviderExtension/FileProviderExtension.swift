@@ -437,6 +437,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	/// The debounced re-drain `materializedItemsDidChange` schedules; replaced (and the old one
 	/// cancelled) on every callback, so a burst coalesces into one drain.
 	private let materializedRedrain = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
+	#if os(iOS)
+		/// Whether a download of the pinned items is running; one at a time is enough, because
+		/// each run works through everything the pins cover.
+		private let prefetching = OSAllocatedUnfairLock<Bool>(initialState: false)
+	#endif
 	/// Attempts for a content upload before the edit is given up on. Three with exponential
 	/// backoff covers a transient blip without keeping a suspended-at-any-moment extension busy.
 	static let uploadAttempts = 3
@@ -465,6 +470,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		} catch {
 			self.authGate.observe(error)
 			throw error
+		}
+		// Every item renders its pin, so the pins are in memory before the first one is served.
+		do {
+			try PinnedItems.load(from: self.state)
+		} catch {
+			Self.logger.error("loading the pinned items failed: \(error)")
 		}
 		self.cachedRootUuid.withLock { $0 = uuid }
 		self.startLaunchWork()
@@ -798,6 +809,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			}
 		}
 
+		#if os(iOS)
+			// A pin made in a process that was suspended before its downloads finished.
+			self.prefetchPinned()
+		#endif
+
 		// Report the containers the system holds materialized — the directories it will never
 		// re-enumerate on its own, whose contents the cache's live path is therefore responsible
 		// for keeping fresh through the working set. Fire-and-forget for the same reason as the
@@ -834,6 +850,33 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
 	// MARK: - Materialized set
 
+	/// Every item the system holds materialized, files and folders, drained page by page from
+	/// `enumeratorForMaterializedItems` and kept only as the identifiers the callers need.
+	static func materializedItems(manager: NSFileProviderManager) async throws
+		-> [MaterializedEntry]
+	{
+		let enumerator = manager.enumeratorForMaterializedItems()
+		var entries: [MaterializedEntry] = []
+		var page: NSFileProviderPage? = NSFileProviderPage(rawValue: Data())
+		while let current = page {
+			let result: (items: [NSFileProviderItem], next: NSFileProviderPage?) =
+				try await withCheckedThrowingContinuation { continuation in
+					enumerator.enumerateItems(
+						for: MaterializedPageObserver(continuation: continuation),
+						startingAt: current)
+				}
+			for item in result.items {
+				entries.append(
+					MaterializedEntry(
+						identifier: item.itemIdentifier.rawValue,
+						parent: item.parentItemIdentifier.rawValue,
+						isFolder: (item.contentType ?? nil) == .folder))
+			}
+			page = result.next
+		}
+		return entries
+	}
+
 	/// Drains `enumeratorForMaterializedItems` and hands the cache the set of materialized
 	/// CONTAINERS. Filtered to folders here: the materialized set holds every downloaded FILE
 	/// too, and each unknown id costs the cache a guaranteed-404 `get_dir` probe on the
@@ -842,32 +885,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	/// set would silently drop containers from freshness; the cache keeps its last-known set.
 	private func reportMaterializedContainers() async {
 		guard let manager = self.manager else { return }
-		let enumerator = manager.enumeratorForMaterializedItems()
-		var containers: [String] = []
-		var page: NSFileProviderPage? = NSFileProviderPage(rawValue: Data())
-		while let current = page {
-			let result: (items: [NSFileProviderItem], next: NSFileProviderPage?)
-			do {
-				result = try await withCheckedThrowingContinuation { continuation in
-					enumerator.enumerateItems(
-						for: MaterializedPageObserver(continuation: continuation),
-						startingAt: current)
-				}
-			} catch {
-				Self.logger.error("draining the materialized set failed: \(error)")
-				return
-			}
-			for item in result.items {
-				let identifier = item.itemIdentifier
-				// The sentinels are not containers of ours; the root is injected by the cache
-				// unconditionally.
-				guard identifier != .rootContainer, identifier != .trashContainer,
-					identifier != .workingSet
-				else { continue }
-				guard (item.contentType ?? nil) == .folder else { continue }
-				containers.append(identifier.rawValue)
-			}
-			page = result.next
+		let materialized: [MaterializedEntry]
+		do {
+			materialized = try await Self.materializedItems(manager: manager)
+		} catch {
+			Self.logger.error("draining the materialized set failed: \(error)")
+			return
+		}
+		// The sentinels are not containers of ours; the root is injected by the cache
+		// unconditionally.
+		let sentinels: Set<String> = [
+			NSFileProviderItemIdentifier.rootContainer.rawValue,
+			NSFileProviderItemIdentifier.trashContainer.rawValue,
+			NSFileProviderItemIdentifier.workingSet.rawValue,
+		]
+		let containers = materialized.compactMap {
+			$0.isFolder && !sentinels.contains($0.identifier) ? $0.identifier : nil
 		}
 		do {
 			try await self.state.setMaterializedContainers(ids: containers)
@@ -1678,4 +1711,255 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		}
 		return progress
 	}
+}
+
+// MARK: - Keep downloaded
+
+extension FileProviderExtension: NSFileProviderCustomAction {
+	func performAction(
+		identifier actionIdentifier: NSFileProviderExtensionActionIdentifier,
+		onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
+		completionHandler: @escaping ((any Error)?) -> Void
+	) -> Progress {
+		if let error = self.signedOutError() {
+			completionHandler(error)
+			return Progress()
+		}
+		guard let action = PinAction(rawValue: actionIdentifier.rawValue) else {
+			completionHandler(NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+			return Progress()
+		}
+		let state = self.state
+		let manager = self.manager
+		let authGate = self.authGate
+		let answer = CallOnce()
+		return self.inFlight.run(
+			Progress(),
+			onCancel: { answer.fire { completionHandler(userCancelledError()) } }
+		) { [weak self] in
+			do {
+				guard let self else { throw CancellationError() }
+				_ = try self.getRootUuid()
+				try await Self.withAsyncActivity("perform \(action.rawValue)") {
+					switch action {
+					case .keep:
+						try await Self.setPinned(
+							true, identifiers: itemIdentifiers, state: state, manager: manager)
+					case .stopKeeping:
+						try await Self.setPinned(
+							false, identifiers: itemIdentifiers, state: state, manager: manager)
+					case .removeDownload:
+						try await Self.removeDownloads(
+							of: itemIdentifiers, state: state, manager: manager)
+					}
+				}
+				answer.fire { completionHandler(nil) }
+				#if os(iOS)
+					if action == .keep { self.prefetchPinned() }
+				#endif
+			} catch {
+				authGate.observe(error)
+				answer.fire { completionHandler(providerError(from: error)) }
+			}
+		}
+	}
+
+	/// Pins or unpins the items, cache first, then tells the system to re-read them: their
+	/// userInfo, content policy and badge all change, and it only re-reads an item it is asked
+	/// about. Asking for a modification is that ask; the system answers with `modifyItem`, whose
+	/// reply renders the new pin under a new metadata version.
+	static func setPinned(
+		_ pinned: Bool, identifiers: [NSFileProviderItemIdentifier],
+		state: FilenMobileCacheState, manager: NSFileProviderManager?
+	) async throws {
+		var changed: [NSFileProviderItemIdentifier] = []
+		for identifier in identifiers {
+			// The rules never offer the sentinels; nothing in them is the user's to pin.
+			guard identifier != .rootContainer, identifier != .trashContainer,
+				identifier != .workingSet
+			else { continue }
+			let id = identifier.rawValue
+			if pinned {
+				// The pin is keyed off the cache's row, which a never-browsed item lacks.
+				var object: FfiObject?
+				do {
+					object = try state.queryItem(path: id)
+				} catch CacheError.DoesNotExist(_) {
+					object = nil
+				}
+				if object == nil, try await state.updateAndQueryItem(id: id) == nil {
+					throw NSFileProviderError(.noSuchItem)
+				}
+			}
+			try state.setPinned(id: id, pinned: pinned)
+			if PinnedItems.contains(identifier) != pinned { changed.append(identifier) }
+			PinnedItems.set(identifier, pinned: pinned)
+		}
+		guard let manager else { return }
+		for identifier in changed {
+			do {
+				try await manager.requestModification(
+					of: [.lastUsedDate], forItemWithIdentifier: identifier)
+			} catch {
+				Self.logger.error(
+					"asking the system to re-read \(identifier.rawValue) failed: \(error)")
+			}
+			#if os(macOS)
+				// The new content policy downloads a pinned item as soon as the system reads it;
+				// this starts a file now, and a directory's first level, rather than whenever the
+				// system gets to it.
+				if pinned {
+					do {
+						try await manager.requestDownloadForItem(withIdentifier: identifier)
+					} catch {
+						Self.logger.error(
+							"requesting the download of \(identifier.rawValue) failed: \(error)")
+					}
+				}
+			#endif
+		}
+	}
+
+	/// "Remove Download": unpins what the selection pinned itself, then evicts every downloaded
+	/// file in it (see `KeepDownloaded.evictionTargets`) and drops the cache's own copy of each, so
+	/// the space is actually freed. An item whose state forbids eviction (an edit not uploaded yet,
+	/// an open file) stays and does not fail the rest.
+	static func removeDownloads(
+		of identifiers: [NSFileProviderItemIdentifier], state: FilenMobileCacheState,
+		manager: NSFileProviderManager?
+	) async throws {
+		guard let manager else { throw transientError("the domain has no manager") }
+		let ownPins = identifiers.filter { PinnedItems.contains($0) }
+		if !ownPins.isEmpty {
+			try await Self.setPinned(false, identifiers: ownPins, state: state, manager: manager)
+		}
+		let targets = KeepDownloaded.evictionTargets(
+			of: Set(identifiers.map(\.rawValue)),
+			materialized: try await Self.materializedItems(manager: manager),
+			pinned: PinnedItems.all)
+		// The keep-downloaded policy just lifted reaches the system asynchronously, and until it
+		// has, eviction fails NonEvictable. Wait it out once; the first eviction that lands shows
+		// it has.
+		var policySettling = !ownPins.isEmpty
+		var firstFailure: (any Error)?
+		for target in targets {
+			let identifier = NSFileProviderItemIdentifier(target)
+			do {
+				try await Self.evict(identifier, manager: manager, waitingOutPolicy: policySettling)
+				policySettling = false
+			} catch {
+				policySettling = false
+				if KeepDownloaded.isExpectedEvictionFailure(error) {
+					Self.logger.info("left \(target) downloaded: \(error)")
+				} else {
+					Self.logger.error("evicting \(target) failed: \(error)")
+					firstFailure = firstFailure ?? error
+				}
+				continue
+			}
+			await Self.dropCachedCopy(of: target, state: state)
+		}
+		if let firstFailure { throw firstFailure }
+	}
+
+	private static func evict(
+		_ identifier: NSFileProviderItemIdentifier, manager: NSFileProviderManager,
+		waitingOutPolicy: Bool
+	) async throws {
+		var delay: UInt64 = 250_000_000
+		var retries = waitingOutPolicy ? 4 : 0
+		while true {
+			do {
+				try await manager.evictItem(identifier: identifier)
+				return
+			} catch let error as NSError
+				where retries > 0 && error.domain == NSFileProviderErrorDomain
+				&& error.code == NSFileProviderError.Code.nonEvictable.rawValue
+			{
+				retries -= 1
+				try await Task.sleep(nanoseconds: delay)
+				delay *= 2
+			}
+		}
+	}
+
+	/// Drops the cache's copy of an evicted file. Not one holding an edit the server lacks: that
+	/// copy is the only one.
+	private static func dropCachedCopy(of id: String, state: FilenMobileCacheState) async {
+		do {
+			guard case .file(let file) = try state.queryItem(path: id),
+				file.pendingUploadAt == nil
+			else { return }
+			try await state.clearLocalCache(item: id)
+		} catch {
+			Self.logger.error("dropping the cached copy of \(id) failed: \(error)")
+		}
+	}
+
+	#if os(iOS)
+		/// Downloads what the pins cover into the cache. iOS has no keep-downloaded content policy
+		/// (`NSFileProviderContentPolicyDownloadEagerlyAndKeepDownloaded` is macOS-only,
+		/// NSFileProviderItem.h) and no `requestDownloadForItem` either, so the bytes are kept
+		/// here instead: in the cache, exempt from its size sweep, serving the next open without a
+		/// transfer. A pinned item's replica is kept by leaving off `allowsEvicting`.
+		func prefetchPinned() {
+			let claimed = self.prefetching.withLock { running -> Bool in
+				if running { return false }
+				running = true
+				return true
+			}
+			guard claimed else { return }
+			let state = self.state
+			let prefetching = self.prefetching
+			self.inFlight.run(Progress()) {
+				await Self.withAsyncActivity("download pinned items") {
+					await Self.prefetchPinned(state: state)
+				}
+				prefetching.withLock { $0 = false }
+			}
+		}
+
+		/// Lists every covered directory the cache has never listed, until none is left, then
+		/// downloads every covered file it holds no bytes of. Sequential: the cache transfers each
+		/// file with its own concurrency, and one item at a time keeps the extension's memory flat.
+		/// A failure leaves that item for the next run.
+		static func prefetchPinned(state: FilenMobileCacheState) async {
+			var attempted = Set<String>()
+			while !Task.isCancelled {
+				let dirs: [String]
+				do {
+					dirs = try state.pinnedDirsToList().filter { !attempted.contains($0) }
+				} catch {
+					Self.logger.error("reading the pinned directories failed: \(error)")
+					return
+				}
+				if dirs.isEmpty { break }
+				for dir in dirs {
+					if Task.isCancelled { return }
+					attempted.insert(dir)
+					do {
+						try await state.updateDirChildren(path: dir)
+					} catch {
+						Self.logger.error("listing pinned directory \(dir) failed: \(error)")
+					}
+				}
+			}
+			let files: [String]
+			do {
+				files = try state.pinnedFilesToFetch()
+			} catch {
+				Self.logger.error("reading the pinned files failed: \(error)")
+				return
+			}
+			for file in files {
+				if Task.isCancelled { return }
+				do {
+					_ = try await state.downloadFileIfChangedByUuid(
+						uuid: file, progressCallback: nil)
+				} catch {
+					Self.logger.error("downloading pinned file \(file) failed: \(error)")
+				}
+			}
+		}
+	#endif
 }

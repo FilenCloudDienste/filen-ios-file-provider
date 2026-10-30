@@ -20,7 +20,7 @@ let DIRECTORY_CONTENT_VERSION = "dir"
 /// every such change: it is part of every metadata version and of the working-set anchor, and the
 /// first launch under a new revision signals the working set, whose enumeration then expires and
 /// re-serves every item once.
-let ITEM_RENDERING_REVISION: UInt8 = 1
+let ITEM_RENDERING_REVISION: UInt8 = 2
 
 func getParentItemIdentifier(itemIdentifier: NSFileProviderItemIdentifier)
 	-> NSFileProviderItemIdentifier

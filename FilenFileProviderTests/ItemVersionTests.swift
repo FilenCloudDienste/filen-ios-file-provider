@@ -93,11 +93,11 @@ final class ItemVersionTests: XCTestCase {
 
 	// MARK: - Metadata
 
-	func testTheMetadataVersionIsTheChangeSequenceLittleEndianThenTheRenderingRevision() {
+	func testTheMetadataVersionIsTheChangeSequenceLittleEndianThenTheRevisionThenThePin() {
 		XCTAssertEqual(
 			makeFile(changeSeq: 258).itemVersion.metadataVersion,
-			Data([2, 1, 0, 0, 0, 0, 0, 0, ITEM_RENDERING_REVISION]),
-			"the metadata version is the cache's change_seq, little-endian, then the revision")
+			Data([2, 1, 0, 0, 0, 0, 0, 0, ITEM_RENDERING_REVISION, 0]),
+			"the metadata version is the cache's change_seq, little-endian, the revision, the pin")
 	}
 
 	/// A replica keeps an item's metadata until the version moves; a version from before the

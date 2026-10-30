@@ -99,6 +99,14 @@
 			);
 			target = FE5800112E5B000000000001 /* FilenFileProviderTestsMac */;
 		};
+		FE5800212E5B000000000001 /* Exceptions for "FilenFileProviderMac" folder in "FilenFileProviderMac" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				FilenFileProviderMac.entitlements,
+				Info.plist,
+			);
+			target = FE5800012E5B000000000001 /* FilenFileProviderMac */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -128,6 +136,9 @@
 		};
 		FE5800202E5B000000000001 /* FilenFileProviderMac */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				FE5800212E5B000000000001 /* Exceptions for "FilenFileProviderMac" folder in "FilenFileProviderMac" target */,
+			);
 			path = FilenFileProviderMac;
 			sourceTree = "<group>";
 		};
@@ -306,6 +317,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				6F42419F2E09567900F3F4BD /* FilenFileProviderExtension */,
+				FE5800202E5B000000000001 /* FilenFileProviderMac */,
 			);
 			name = FilenFileProviderMac;
 			packageProductDependencies = (

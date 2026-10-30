@@ -92,6 +92,22 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	}
 
 	var capabilities: NSFileProviderItemCapabilities {
+		#if os(iOS)
+			// iOS evicts only an item that allows it ("If this capability is not present, the item
+			// will never be evicted." — NSFileProviderItem.h; the deprecation there is macOS-only,
+			// where the content policy replaces it). Without it neither the system nor
+			// `evictItem` frees a download ("content policy prevention", -2008). Leaving it off a
+			// pinned item is the keep-downloaded iOS has.
+			switch self.object {
+			case .file(_), .dir(_):
+				if !self.isPinned { return self.baseCapabilities.union(.allowsEvicting) }
+			case .root(_): break
+			}
+		#endif
+		return self.baseCapabilities
+	}
+
+	private var baseCapabilities: NSFileProviderItemCapabilities {
 		switch self.object {
 		case .file(_):
 			if self.inTrash {
@@ -137,31 +153,61 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	/// `metadataVersion` is the cache's `change_seq`, a local counter that rises whenever anything
 	/// a replica renders about the item changes and stands still otherwise. Purely local state (a
 	/// cached copy, an outstanding edit) deliberately does not move it. `ITEM_RENDERING_REVISION`
-	/// follows it, so a change to how this type renders an unchanged row reaches existing replicas.
+	/// follows it, so a change to how this type renders an unchanged row reaches existing replicas,
+	/// and then the pin, which is local state a replica does render (userInfo, content policy,
+	/// badge): the system keeps an item's metadata while its version stands still.
 	var itemVersion: NSFileProviderItemVersion {
 		switch self.object {
 		case .file(let ffiFile):
 			return NSFileProviderItemVersion(
 				contentVersion: Data(ffiFile.uuid.utf8),
-				metadataVersion: Self.versionBytes(ffiFile.changeSeq))
+				metadataVersion: Self.versionBytes(ffiFile.changeSeq, pinned: self.isPinned))
 		case .dir(let ffiDir):
 			return NSFileProviderItemVersion(
 				contentVersion: Data(DIRECTORY_CONTENT_VERSION.utf8),
-				metadataVersion: Self.versionBytes(ffiDir.changeSeq))
+				metadataVersion: Self.versionBytes(ffiDir.changeSeq, pinned: self.isPinned))
 		case .root(_):
 			// A root is never replicated as an item; it needs a version only because the system
 			// reads one off whatever it is handed.
 			return NSFileProviderItemVersion(
 				contentVersion: Data(DIRECTORY_CONTENT_VERSION.utf8),
-				metadataVersion: Self.versionBytes(0))
+				metadataVersion: Self.versionBytes(0, pinned: false))
 		}
 	}
 
-	private static func versionBytes(_ changeSeq: Int64) -> Data {
+	private static func versionBytes(_ changeSeq: Int64, pinned: Bool) -> Data {
 		var bytes = withUnsafeBytes(of: changeSeq.littleEndian) { Data($0) }
 		bytes.append(ITEM_RENDERING_REVISION)
+		bytes.append(pinned ? 1 : 0)
 		return bytes
 	}
+
+	/// Whether the user pinned this item itself, as opposed to a directory above it.
+	var isPinned: Bool {
+		switch self.object {
+		case .file(_), .dir(_): return PinnedItems.contains(self.identifier)
+		case .root(_): return false
+		}
+	}
+
+	/// A live file or directory; the root and the trash have nothing to keep.
+	private var isPinnable: Bool {
+		switch self.object {
+		case .file(_), .dir(_): return !self.inTrash
+		case .root(_): return false
+		}
+	}
+
+	/// What the custom action rules in Info.plist read; see `KeepDownloaded`.
+	var userInfo: [AnyHashable: Any]? {
+		KeepDownloaded.userInfo(pinned: self.isPinned, pinnable: self.isPinnable)
+	}
+
+	#if os(macOS)
+		var contentPolicy: NSFileProviderContentPolicy {
+			KeepDownloaded.contentPolicy(pinned: self.isPinned)
+		}
+	#endif
 
 	var contentType: UTType {
 		switch self.object {
@@ -292,3 +338,19 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		FileProviderExtension.downloadingSet.withLock { $0[self.identifier.rawValue] != nil }
 	}
 }
+
+#if os(macOS)
+	/// The badge on a pinned item. Declared under `NSFileProviderDecorations` in the macOS
+	/// Info.plist, whose identifier is the extension's bundle id plus this suffix.
+	let KEEP_DOWNLOADED_DECORATION_SUFFIX = ".keepDownloaded"
+
+	extension FileProviderItem: NSFileProviderItemDecorating {
+		var decorations: [NSFileProviderItemDecorationIdentifier]? {
+			guard self.isPinned, let bundleId = Bundle.main.bundleIdentifier else { return nil }
+			return [
+				NSFileProviderItemDecorationIdentifier(
+					rawValue: bundleId + KEEP_DOWNLOADED_DECORATION_SUFFIX)
+			]
+		}
+	}
+#endif
