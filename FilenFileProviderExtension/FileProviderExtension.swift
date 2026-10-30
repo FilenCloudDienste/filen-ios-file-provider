@@ -428,6 +428,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	private let inFlight = InFlightWork()
 	/// Answers `.notAuthenticated` without touching the cache while it is known to be signed out.
 	private let authGate: AuthGate
+	/// Tells the system about working-set changes, coalesced. The cache's live path drives it; a
+	/// recursive delete drives it too, so the subtree's deletions are collected without waiting.
+	private let workingSetSignaller: WorkingSetSignaller
 	/// Whether the launch work (pending-upload drain, materialized-container report) has started.
 	/// It needs a session, so it waits for the first call the cache answers as signed in.
 	private let launchWorkStarted = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -732,11 +735,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 				authGate: authGate)
 		#endif
 
+		self.workingSetSignaller = WorkingSetSignaller(manager: manager)
+
 		super.init()
 
 		// Registered before anything else asks the cache for work: from here on, a tracked file
 		// that changes on the drive reaches the system without the system having asked.
-		self.state.setWorkingSetListener(listener: WorkingSetSignaller(manager: manager))
+		self.state.setWorkingSetListener(listener: self.workingSetSignaller)
 
 		// The launch work needs a session. Signed in, this one call starts it; signed out, it waits
 		// for the first call the cache answers (see `getRootUuid`) instead of failing here. Off the
@@ -1486,6 +1491,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
 				try await state.deleteItem(item: id)
 				answer.fire { completionHandler(nil) }
+				// "If the deletion is recursive the provider should take care of reporting the
+				// deletion of all the deleted items through the working set."
+				// — NSFileProviderReplicatedExtension.h
+				if options.contains(.recursive) {
+					self.workingSetSignaller.workingSetChanged()
+				}
 			} catch CacheError.DoesNotExist(_) {
 				// "If the deletion targets an item that is unknown from the extension because that
 				// item may have already been deleted remotely, then the extension should report a
