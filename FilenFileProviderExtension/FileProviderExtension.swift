@@ -782,6 +782,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			}
 		}
 
+		// A new rendering revision changes how every item renders, but nothing the cache tracks
+		// moved, so nothing else would make the system ask. One working-set signal per revision
+		// and domain: the system answers it with the anchor it holds, which the revision expires,
+		// and the re-enumeration re-serves every item.
+		let revisionKey = "renderedRevision." + self.domainKey
+		if UserDefaults.standard.object(forKey: revisionKey) as? Int != Int(ITEM_RENDERING_REVISION) {
+			self.inFlight.run(Progress()) {
+				do {
+					try await manager?.signalEnumerator(for: .workingSet)
+					UserDefaults.standard.set(Int(ITEM_RENDERING_REVISION), forKey: revisionKey)
+				} catch {
+					Self.logger.error("Signalling the working set for a new revision failed: \(error)")
+				}
+			}
+		}
+
 		// Report the containers the system holds materialized — the directories it will never
 		// re-enumerate on its own, whose contents the cache's live path is therefore responsible
 		// for keeping fresh through the working set. Fire-and-forget for the same reason as the

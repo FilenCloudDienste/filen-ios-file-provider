@@ -95,12 +95,26 @@ final class ItemDateTests: XCTestCase {
 		XCTAssertEqual(item.contentModificationDate, Self.date(Self.timestamp))
 	}
 
-	/// A zero date is a real date, not a missing one — the fallback must not fire for it, or an
-	/// item genuinely dated at the epoch would silently report the row timestamp instead.
-	func testAZeroCreationDateIsNotTreatedAsMissing() {
+	/// Clients write 0 when they have no date; rendered as a date it shows as 1970.
+	func testAZeroDateIsTreatedAsMissing() {
 		let item = file(meta: fileMeta(created: 0, modified: 0))
 
-		XCTAssertEqual(item.creationDate, Self.date(0))
-		XCTAssertEqual(item.contentModificationDate, Self.date(0))
+		XCTAssertEqual(item.creationDate, Self.date(Self.timestamp))
+		XCTAssertEqual(item.contentModificationDate, Self.date(Self.timestamp))
+	}
+
+	/// ...and a negative one, such as the 1904 HFS epoch, is the same placeholder.
+	func testANegativeDateIsTreatedAsMissing() {
+		let item = file(meta: fileMeta(created: -2_082_844_800_000, modified: Self.modified))
+
+		XCTAssertEqual(item.creationDate, Self.date(Self.timestamp))
+		XCTAssertEqual(item.contentModificationDate, Self.date(Self.modified))
+	}
+
+	func testADirectoryWithAZeroCreationDateFallsBackForBothDates() {
+		let item = dir(meta: FfiDirMeta(name: "Photos", created: 0))
+
+		XCTAssertEqual(item.creationDate, Self.date(Self.timestamp))
+		XCTAssertEqual(item.contentModificationDate, Self.date(Self.timestamp))
 	}
 }

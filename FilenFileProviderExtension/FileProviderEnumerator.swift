@@ -51,6 +51,22 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 		self.enumerationAnchor = nil
 	}
 
+	/// The anchor handed to the system: the cache's own behind `ITEM_RENDERING_REVISION`, so an
+	/// anchor issued before a rendering change expires and the re-enumeration re-serves every item.
+	static func systemAnchor(cacheAnchor: Data) -> NSFileProviderSyncAnchor {
+		var bytes = Data([ITEM_RENDERING_REVISION])
+		bytes.append(cacheAnchor)
+		return NSFileProviderSyncAnchor(bytes)
+	}
+
+	/// The cache's anchor inside one the system handed back, or nil when another rendering
+	/// revision (or nobody) issued it — an expired anchor either way.
+	static func cacheAnchor(from anchor: NSFileProviderSyncAnchor) -> Data? {
+		let bytes = anchor.rawValue
+		guard bytes.first == ITEM_RENDERING_REVISION else { return nil }
+		return Data(bytes.dropFirst())
+	}
+
 	/// The item as the working set should present it: with the container it actually lives in,
 	/// never the working-set sentinel.
 	private func item(for object: FfiObject) -> FileProviderItem? {
@@ -72,7 +88,7 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 		// connection) and the anchor is stashed for `currentSyncAnchor` — see there for why.
 		do {
 			let workingSet = try self.state.queryWorkingSetWithAnchor()
-			self.stashAnchor(NSFileProviderSyncAnchor(workingSet.anchor))
+			self.stashAnchor(Self.systemAnchor(cacheAnchor: workingSet.anchor))
 			observer.didEnumerate(workingSet.items.compactMap(self.item(for:)))
 			observer.finishEnumerating(upTo: nil)
 		} catch {
@@ -92,7 +108,7 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 			return
 		}
 		do {
-			completionHandler(NSFileProviderSyncAnchor(try self.state.currentSyncAnchor()))
+			completionHandler(Self.systemAnchor(cacheAnchor: try self.state.currentSyncAnchor()))
 		} catch {
 			// A nil anchor asks the system to enumerate from scratch instead, which is the honest
 			// answer when the cache cannot say where it stands.
@@ -140,19 +156,22 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 				// 0 means "unbounded" to the cache, which is exactly the wedge paging exists to
 				// prevent — never pass it.
 				let batchSize = UInt32(clamping: suggested > 0 ? suggested : Self.changeBatchSize)
+				guard let cacheAnchor = Self.cacheAnchor(from: anchor) else {
+					throw CacheError.SyncAnchorExpired("issued under another rendering revision")
+				}
 				let changes = try self.state.enumerateChangesPage(
-					anchor: anchor.rawValue, limit: batchSize)
+					anchor: cacheAnchor, limit: batchSize)
 				let updated = changes.updated.compactMap(self.item(for:))
 				let deleted = changes.deletedIds.map { NSFileProviderItemIdentifier($0) }
 				// The diff delivered everything up to its anchor, so that anchor is paired with
 				// served state exactly like a full enumeration's — keep the stash current with it.
-				self.stashAnchor(NSFileProviderSyncAnchor(changes.anchor))
+				let next = Self.systemAnchor(cacheAnchor: changes.anchor)
+				self.stashAnchor(next)
 				// One block, so a cancellation cannot land between the updates and the finish.
 				answer.fire {
 					observer.didUpdate(updated)
 					observer.didDeleteItems(withIdentifiers: deleted)
-					observer.finishEnumeratingChanges(
-						upTo: NSFileProviderSyncAnchor(changes.anchor), moreComing: changes.more)
+					observer.finishEnumeratingChanges(upTo: next, moreComing: changes.more)
 				}
 
 				// Nothing more to do here for working-set tracking: `enumerateChanges` above

@@ -14,6 +14,14 @@ let LOCAL_DATA_LAST_USED = "LastUsedDate"
 /// says what it is in a log.
 let DIRECTORY_CONTENT_VERSION = "dir"
 
+/// How `FileProviderItem` renders a cache row. The system keeps an item's metadata until its
+/// metadata version moves, and the cache moves that only when the row changes, so a rendering
+/// change (a capability, a date fallback) would never reach items already on disk. Bump it with
+/// every such change: it is part of every metadata version and of the working-set anchor, and the
+/// first launch under a new revision signals the working set, whose enumeration then expires and
+/// re-serves every item once.
+let ITEM_RENDERING_REVISION: UInt8 = 1
+
 func getParentItemIdentifier(itemIdentifier: NSFileProviderItemIdentifier)
 	-> NSFileProviderItemIdentifier
 {

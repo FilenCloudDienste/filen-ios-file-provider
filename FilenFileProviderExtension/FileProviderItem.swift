@@ -95,8 +95,10 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		switch self.object {
 		case .file(_):
 			if self.inTrash {
-				// allowsTrashing also specifies that it can be restored
-				[.allowsTrashing, .allowsDeleting]
+				// allowsTrashing also specifies that it can be restored. allowsWriting keeps the
+				// replica unlocked: the system locks an item it may not write, and a locked item
+				// it creates in the trash fails with EPERM and pauses the whole domain.
+				[.allowsWriting, .allowsTrashing, .allowsDeleting]
 			} else {
 				[
 					.allowsReading, .allowsWriting, .allowsRenaming, .allowsTrashing,
@@ -105,8 +107,8 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 			}
 		case .dir(_):
 			if self.inTrash {
-				// allowsTrashing also specifies that it can be restored
-				[.allowsTrashing, .allowsDeleting]
+				// See the file case; on a directory allowsWriting is allowsAddingSubItems.
+				[.allowsWriting, .allowsTrashing, .allowsDeleting]
 			} else {
 				[
 					.allowsContentEnumerating, .allowsAddingSubItems, .allowsRenaming,
@@ -134,7 +136,8 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	///
 	/// `metadataVersion` is the cache's `change_seq`, a local counter that rises whenever anything
 	/// a replica renders about the item changes and stands still otherwise. Purely local state (a
-	/// cached copy, an outstanding edit) deliberately does not move it.
+	/// cached copy, an outstanding edit) deliberately does not move it. `ITEM_RENDERING_REVISION`
+	/// follows it, so a change to how this type renders an unchanged row reaches existing replicas.
 	var itemVersion: NSFileProviderItemVersion {
 		switch self.object {
 		case .file(let ffiFile):
@@ -155,7 +158,9 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	}
 
 	private static func versionBytes(_ changeSeq: Int64) -> Data {
-		withUnsafeBytes(of: changeSeq.littleEndian) { Data($0) }
+		var bytes = withUnsafeBytes(of: changeSeq.littleEndian) { Data($0) }
+		bytes.append(ITEM_RENDERING_REVISION)
+		return bytes
 	}
 
 	var contentType: UTType {
@@ -201,14 +206,22 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		Date(timeIntervalSince1970: TimeInterval(millis) / 1000)
 	}
 
+	/// A date, or nil when the value is a placeholder: clients write 0 (the Unix epoch) or a
+	/// negative value (the 1904 HFS epoch) when they have no date, which the Files app would show
+	/// as 1970 or earlier.
+	private static func knownDate(_ millis: Int64?) -> Date? {
+		guard let millis, millis > 0 else { return nil }
+		return Self.date(millis)
+	}
+
 	/// When the server minted the item's row: the one date the drive always knows, because it
 	/// sits outside the encrypted metadata. Both dates below fall back to it — metadata that
 	/// will not decrypt, or that was written without dates of its own, otherwise leaves the item
 	/// dateless, which the Files app shows as "--" and sorts below everything that has a date.
 	private var remoteTimestamp: Date? {
 		switch self.object {
-		case .file(let ffiFile): return Self.date(ffiFile.timestamp)
-		case .dir(let ffiDir): return Self.date(ffiDir.timestamp)
+		case .file(let ffiFile): return Self.knownDate(ffiFile.timestamp)
+		case .dir(let ffiDir): return Self.knownDate(ffiDir.timestamp)
 		case .root(_): return nil
 		}
 	}
@@ -216,19 +229,19 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var contentModificationDate: Date? {
 		switch self.object {
 		case .file(let ffiFile):
-			return (ffiFile.meta?.modified).map(Self.date) ?? self.remoteTimestamp
+			return Self.knownDate(ffiFile.meta?.modified) ?? self.remoteTimestamp
 		case .dir(let ffiDir):
 			// A directory has no modification date of its own; its creation date is the closest
 			// thing, and the row timestamp behind that.
-			return (ffiDir.meta?.created).map(Self.date) ?? self.remoteTimestamp
+			return Self.knownDate(ffiDir.meta?.created) ?? self.remoteTimestamp
 		case .root(_): return nil
 		}
 	}
 
 	var creationDate: Date? {
 		switch self.object {
-		case .file(let file): return (file.meta?.created).map(Self.date) ?? self.remoteTimestamp
-		case .dir(let dir): return (dir.meta?.created).map(Self.date) ?? self.remoteTimestamp
+		case .file(let file): return Self.knownDate(file.meta?.created) ?? self.remoteTimestamp
+		case .dir(let dir): return Self.knownDate(dir.meta?.created) ?? self.remoteTimestamp
 		case .root(_): return nil
 		}
 	}

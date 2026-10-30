@@ -93,11 +93,19 @@ final class ItemVersionTests: XCTestCase {
 
 	// MARK: - Metadata
 
-	func testTheMetadataVersionIsTheChangeSequenceLittleEndian() {
+	func testTheMetadataVersionIsTheChangeSequenceLittleEndianThenTheRenderingRevision() {
 		XCTAssertEqual(
 			makeFile(changeSeq: 258).itemVersion.metadataVersion,
-			Data([2, 1, 0, 0, 0, 0, 0, 0]),
-			"the metadata version is the cache's change_seq, little-endian")
+			Data([2, 1, 0, 0, 0, 0, 0, 0, ITEM_RENDERING_REVISION]),
+			"the metadata version is the cache's change_seq, little-endian, then the revision")
+	}
+
+	/// A replica keeps an item's metadata until the version moves; a version from before the
+	/// revision existed (the bare change sequence) must not match, or a rendering fix never lands.
+	func testTheRenderingRevisionSetsTheVersionApartFromTheBareChangeSequence() {
+		XCTAssertNotEqual(
+			makeDir(changeSeq: 21).itemVersion.metadataVersion,
+			withUnsafeBytes(of: Int64(21).littleEndian) { Data($0) })
 	}
 
 	func testAMetadataChangeMovesTheMetadataVersion() {
