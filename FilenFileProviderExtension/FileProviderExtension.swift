@@ -269,6 +269,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	private struct RetainedCacheState {
 		let authIdentity: Data
 		let state: FilenMobileCacheState
+		let authGate: AuthGate
 	}
 
 	private static let retainedState = OSAllocatedUnfairLock<[String: RetainedCacheState]>(
@@ -348,13 +349,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	/// have changed since the retained one was built.
 	private static func cacheState(
 		domainKey: String, authIdentity: Data, build: () -> FilenMobileCacheState
-	) -> FilenMobileCacheState {
-		let reused = Self.retainedState.withLock { map -> FilenMobileCacheState? in
+	) -> (state: FilenMobileCacheState, authGate: AuthGate) {
+		let reused = Self.retainedState.withLock {
+			map -> (state: FilenMobileCacheState, authGate: AuthGate)? in
 			guard let entry = map[domainKey], entry.authIdentity == authIdentity else {
 				return nil
 			}
 
-			return entry.state
+			return (entry.state, entry.authGate)
 		}
 
 		if let reused {
@@ -381,12 +383,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// build one and the loser would be retained only by its own instance — the system does not
 		// construct concurrent instances for a single domain in practice.
 		let fresh = build()
+		let authGate = AuthGate()
 
 		Self.retainedState.withLock { map in
-			map[domainKey] = RetainedCacheState(authIdentity: authIdentity, state: fresh)
+			map[domainKey] = RetainedCacheState(
+				authIdentity: authIdentity, state: fresh, authGate: authGate)
 		}
 
-		return fresh
+		return (fresh, authGate)
 	}
 
 	/// Runs `work` inside a `ProcessInfo` activity. Apple names this as the remedy for 0xdead10cc
@@ -422,6 +426,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	// same locking as the two sets underneath it, not a bare var.
 	private let cachedRootUuid = OSAllocatedUnfairLock<String?>(initialState: nil)
 	private let inFlight = InFlightWork()
+	/// Answers `.notAuthenticated` without touching the cache while it is known to be signed out.
+	private let authGate: AuthGate
+	/// Whether the launch work (pending-upload drain, materialized-container report) has started.
+	/// It needs a session, so it waits for the first call the cache answers as signed in.
+	private let launchWorkStarted = OSAllocatedUnfairLock<Bool>(initialState: false)
 	/// The debounced re-drain `materializedItemsDidChange` schedules; replaced (and the old one
 	/// cancelled) on every callback, so a burst coalesces into one drain.
 	private let materializedRedrain = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
@@ -433,17 +442,41 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	#if os(macOS)
 		/// Vended through `supportedServiceSources`, see AuthService.swift.
 		let authService: AuthServiceSource
+		/// The cache's files directory, where the thumbnail fallback keeps what it makes.
+		private let filesDir: URL
 	#endif
 
 	// MARK: - Identity
 
+	/// Every entry point asks for this first, so it is also where a signed-out cache is answered
+	/// without being asked (see `AuthGate`) and where the first signed-in answer starts the launch
+	/// work.
 	func getRootUuid() throws -> String {
+		try self.authGate.check()
 		if let cached = self.cachedRootUuid.withLock({ $0 }) { return cached }
 		// Fetched outside the lock: it can throw and hits the cache DB, and a duplicate fetch on a
 		// cold race is harmless — both callers compute the same immutable root uuid.
-		let uuid = try self.state.rootUuid()
+		let uuid: String
+		do {
+			uuid = try self.state.rootUuid()
+		} catch {
+			self.authGate.observe(error)
+			throw error
+		}
 		self.cachedRootUuid.withLock { $0 = uuid }
+		self.startLaunchWork()
 		return uuid
+	}
+
+	/// `.notAuthenticated` while the cache is known to be signed out, else nil. Checked before a
+	/// call starts any work, so the system's retries of a signed-out call cost no task either.
+	private func signedOutError() -> (any Error)? {
+		do {
+			try self.authGate.check()
+			return nil
+		} catch {
+			return error
+		}
 	}
 
 	/// The cache id an identifier names. The system's two container sentinels have cache forms of
@@ -676,7 +709,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// Opening the database, and closing any state displaced by a credential change, both take
 		// database locks — so both happen inside an activity assertion rather than wherever the
 		// system happened to schedule this instance.
-		self.state = Self.withActivity("open the file provider cache") {
+		let opened = Self.withActivity("open the file provider cache") {
 			Self.cacheState(
 				domainKey: domainKey,
 				authIdentity: Self.authIdentity(authFile: authFile, dek: dek)
@@ -689,9 +722,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			}
 		}
 
+		self.state = opened.state
+		let authGate = opened.authGate
+		self.authGate = authGate
 		#if os(macOS)
+			self.filesDir = filesDir
 			self.authService = AuthServiceSource(
-				state: self.state, manager: manager, authFile: authFileURL, dek: dek)
+				state: self.state, manager: manager, authFile: authFileURL, dek: dek,
+				authGate: authGate)
 		#endif
 
 		super.init()
@@ -700,11 +738,29 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// that changes on the drive reaches the system without the system having asked.
 		self.state.setWorkingSetListener(listener: WorkingSetSignaller(manager: manager))
 
+		// The launch work needs a session. Signed in, this one call starts it; signed out, it waits
+		// for the first call the cache answers (see `getRootUuid`) instead of failing here. Off the
+		// init path, because a session that landed since construction is read on this call.
+		self.inFlight.run(Progress()) { [weak self] in
+			Self.withActivity("start the launch work") { _ = try? self?.getRootUuid() }
+		}
+	}
+
+	/// Runs once per instance, on the first call the cache answers as signed in.
+	private func startLaunchWork() {
+		let first = self.launchWorkStarted.withLock { started -> Bool in
+			if started { return false }
+			started = true
+			return true
+		}
+		guard first else { return }
+		let state = self.state
+		let manager = self.manager
+
 		// An edit whose upload failed stays marked in the cache, and nothing drains those markers
 		// on its own. This process is the only thing that reliably runs after a failure, so drain
 		// on the way up. Registered as in-flight work so a discarded instance lets go of it; a
 		// slow drain must not delay the first operation the system asks for, hence no await.
-		let state = self.state
 		self.inFlight.run(Progress()) {
 			await Self.withAsyncActivity("drain pending uploads") {
 				do {
@@ -806,6 +862,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	/// re-drain + wholesale replace — idempotent, one code path, self-healing.
 	func materializedItemsDidChange(completionHandler: @escaping () -> Void) {
 		completionHandler()
+		// Signed out, there is nothing to report to; the launch work reports once signed in.
+		guard self.launchWorkStarted.withLock({ $0 }) else { return }
 		let task = Task { [weak self] in
 			try? await Task.sleep(nanoseconds: 2_000_000_000)
 			guard !Task.isCancelled else { return }
@@ -862,7 +920,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		for identifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest,
 		completionHandler: @escaping (NSFileProviderItem?, (any Error)?) -> Void
 	) -> Progress {
+		if let error = self.signedOutError() {
+			completionHandler(nil, error)
+			return Progress()
+		}
 		let state = self.state
+		let authGate = self.authGate
 		let answer = CallOnce()
 		return self.inFlight.run(
 			Progress(),
@@ -875,6 +938,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 					state: state, identifier: identifier, rootUuid: rootUuid)
 				answer.fire { completionHandler(item, nil) }
 			} catch {
+				authGate.observe(error)
 				answer.fire { completionHandler(nil, providerError(from: error)) }
 			}
 		}
@@ -902,7 +966,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		request: NSFileProviderRequest,
 		completionHandler: @escaping (URL?, NSFileProviderItem?, (any Error)?) -> Void
 	) -> Progress {
+		if let error = self.signedOutError() {
+			completionHandler(nil, nil, error)
+			return Progress()
+		}
 		let state = self.state
+		let authGate = self.authGate
 		let progress = Progress()
 		let answer = CallOnce()
 		let abort = FfiAbortController()
@@ -942,6 +1011,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 						for: object, fallbackFrom: itemIdentifier, rootUuid: rootUuid))
 				answer.fire { completionHandler(staged, item, nil) }
 			} catch {
+				authGate.observe(error)
 				answer.fire { completionHandler(nil, nil, providerError(from: error)) }
 			}
 		}
@@ -967,7 +1037,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			NSFileProviderItem?, NSFileProviderItemFields, Bool, (any Error)?
 		) -> Void
 	) -> Progress {
+		if let error = self.signedOutError() {
+			completionHandler(nil, [], false, error)
+			return Progress()
+		}
 		let state = self.state
+		let authGate = self.authGate
 		let progress = Progress()
 		let answer = CallOnce()
 		let abort = FfiAbortController()
@@ -1112,6 +1187,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 					completionHandler(item, fields.subtracting(applied), fetchContents, nil)
 				}
 			} catch {
+				authGate.observe(error)
 				answer.fire { completionHandler(nil, [], false, providerError(from: error)) }
 			}
 		}
@@ -1280,7 +1356,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			NSFileProviderItem?, NSFileProviderItemFields, Bool, (any Error)?
 		) -> Void
 	) -> Progress {
+		if let error = self.signedOutError() {
+			completionHandler(nil, [], false, error)
+			return Progress()
+		}
 		let state = self.state
+		let authGate = self.authGate
 		let progress = Progress()
 		let answer = CallOnce()
 		let abort = FfiAbortController()
@@ -1339,6 +1420,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 						for: object, fallbackFrom: identifier, rootUuid: rootUuid))
 				answer.fire { completionHandler(modified, stillPending, false, nil) }
 			} catch {
+				authGate.observe(error)
 				answer.fire { completionHandler(nil, [], false, providerError(from: error)) }
 			}
 		}
@@ -1374,7 +1456,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		options: NSFileProviderDeleteItemOptions, request: NSFileProviderRequest,
 		completionHandler: @escaping ((any Error)?) -> Void
 	) -> Progress {
+		if let error = self.signedOutError() {
+			completionHandler(error)
+			return Progress()
+		}
 		let state = self.state
+		let authGate = self.authGate
 		let answer = CallOnce()
 		return self.inFlight.run(
 			Progress(),
@@ -1405,6 +1492,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 				// success." — NSFileProviderReplicatedExtension.h
 				answer.fire { completionHandler(nil) }
 			} catch {
+				authGate.observe(error)
 				answer.fire { completionHandler(providerError(from: error)) }
 			}
 		}
@@ -1425,7 +1513,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 				rootUuid: try self.getRootUuid())
 			// Everything, not just CacheError: "Errors must be in one of the following domains:
 			// NSCocoaErrorDomain, NSFileProviderErrorDomain." — NSFileProviderReplicatedExtension.h
-		} catch { throw providerError(from: error) }
+		} catch {
+			self.authGate.observe(error)
+			throw providerError(from: error)
+		}
 	}
 
 	// MARK: - Retrying
@@ -1497,6 +1588,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// Asking the Rust pipeline for 2048 made it refuse nearly every real
 		// photo as over-budget, and the system caches that refusal until the
 		// item's contentVersion changes, so the thumbnails never came back.
+		if let error = self.signedOutError() {
+			completionHandler(error)
+			return Progress()
+		}
 		let requested = min(max(size.width, size.height), Self.maxThumbnailPixels)
 		Self.logger.debug(
 			"fetchThumbnails for \(itemIdentifiers.count) items at \(size.width)x\(size.height), serving \(requested)"
@@ -1509,13 +1604,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// Deregistration runs from the completion handler, so the entry never outlives the
 		// work; `register` before the call so a teardown racing it still finds something.
 		let deregister = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
-		let fetchHandler = FetchThumbnailHandler(
-			perThumbnailCompletionHandler: perThumbnailCompletionHandler,
-			completionHandler: { error in
-				deregister.withLock { $0?() }
-				answer.fire { completionHandler(error) }
-			},
-			progress: progress)
+		let complete: @Sendable (Error?) -> Void = { error in
+			deregister.withLock { $0?() }
+			answer.fire { completionHandler(error) }
+		}
+		#if os(macOS)
+			// The cache cannot decode HEIC, HEIF or AVIF here; ImageIO makes those.
+			let fetchHandler = FetchThumbnailHandler(
+				perThumbnailCompletionHandler: perThumbnailCompletionHandler,
+				completionHandler: complete, progress: progress,
+				fallback: ThumbnailFallback(
+					state: self.state, filesDir: self.filesDir, pixels: Int(requested)))
+		#else
+			let fetchHandler = FetchThumbnailHandler(
+				perThumbnailCompletionHandler: perThumbnailCompletionHandler,
+				completionHandler: complete, progress: progress)
+		#endif
 		do {
 			let thumbnailTask = try self.state.getThumbnails(
 				items: itemIdentifiers.map { $0.rawValue }, requestedWidth: UInt32(requested),
@@ -1526,16 +1630,23 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			let unregister = self.inFlight.register {
 				answer.fire { completionHandler(userCancelledError()) }
 				thumbnailTask.cancel()
+				#if os(macOS)
+					fetchHandler.cancelFallbacks()
+				#endif
 			}
 			deregister.withLock { $0 = unregister }
 			progress.cancellationHandler = {
 				unregister()
 				answer.fire { completionHandler(userCancelledError()) }
 				thumbnailTask.cancel()
+				#if os(macOS)
+					fetchHandler.cancelFallbacks()
+				#endif
 			}
 		} catch let error {
 			// getThumbnails should throw a CacheError, but guard against any
 			// other error type so we never force-crash the extension
+			self.authGate.observe(error)
 			answer.fire { completionHandler(providerError(from: error)) }
 		}
 		return progress

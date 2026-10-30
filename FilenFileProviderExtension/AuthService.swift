@@ -129,14 +129,19 @@
 		private let authFile: URL?
 		/// The key the running cache state was built with, so a sealed file is one it can open.
 		private let dek: Data
+		private let authGate: AuthGate
 		private let listenerLock = NSLock()
 		private var listener: NSXPCListener?
 
-		init(state: FilenMobileCacheState, manager: NSFileProviderManager?, authFile: URL?, dek: Data) {
+		init(
+			state: FilenMobileCacheState, manager: NSFileProviderManager?, authFile: URL?, dek: Data,
+			authGate: AuthGate
+		) {
 			self.state = state
 			self.manager = manager
 			self.authFile = authFile
 			self.dek = dek
+			self.authGate = authGate
 			super.init()
 		}
 
@@ -166,7 +171,7 @@
 				if let error {
 					Self.logger.error("setAuth rejected: \(error.localizedDescription, privacy: .public)")
 				} else {
-					Self.logger.info("setAuth stored a new session")
+					Self.logger.notice("setAuth stored a new session")
 					self.nudge()
 				}
 				reply(error)
@@ -180,6 +185,7 @@
 			Self.queue.async {
 				self.state.stopLiveUpdates()
 				guard let authFile = self.authFile else {
+					Self.logger.error("clearAuth has no auth.json location")
 					reply(nil)
 					return
 				}
@@ -192,7 +198,7 @@
 					reply(authServiceError(.writeFailed, "auth.json could not be removed"))
 					return
 				}
-				Self.logger.info("clearAuth removed the session")
+				Self.logger.notice("clearAuth removed the session")
 				reply(nil)
 			}
 		}
@@ -239,10 +245,13 @@
 
 		/// Asks the system to come back now rather than after its own backoff: lifts the
 		/// not-authenticated throttling and has it ask for the working set, whose first call makes
-		/// the cache re-read auth.json.
+		/// the cache re-read auth.json. The gate opens first, or that call could still be answered
+		/// from a signed-out verdict taken before the session landed.
 		private func nudge() {
 			guard let manager = self.manager else { return }
+			let authGate = self.authGate
 			Self.queue.asyncAfter(deadline: .now() + Self.nudgeDelay) {
+				authGate.reopen()
 				manager.signalErrorResolved(NSFileProviderError(.notAuthenticated)) { error in
 					if let error { Self.logger.error("signalErrorResolved failed: \(error)") }
 				}

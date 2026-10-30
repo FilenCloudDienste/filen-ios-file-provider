@@ -31,7 +31,9 @@
 		}
 
 		private func service(dek: Data? = nil) -> AuthServiceSource {
-			AuthServiceSource(state: state, manager: nil, authFile: authFile, dek: dek ?? self.dek)
+			AuthServiceSource(
+				state: state, manager: nil, authFile: authFile, dek: dek ?? self.dek,
+				authGate: AuthGate())
 		}
 
 		private func setAuth(_ payload: Data, on service: AuthServiceSource? = nil) async -> NSError? {
