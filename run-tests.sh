@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Runs the live cache integration tests against the iOS simulator.
+# Runs the live cache integration tests against the iOS simulator, or natively with --macos.
 #
 # The session is read from this project's own `.env` (see `.env.example`), keeping the project
 # self-contained. In CI there is usually no `.env` at all — export the same variables from your
@@ -14,12 +14,20 @@
 # variables, which it forwards into the test process with the prefix stripped. Nothing reads the
 # .env from inside the simulator.
 #
-# Usage: ./run-tests.sh [additional xcodebuild args...]
+# Usage: ./run-tests.sh [--macos] [additional xcodebuild args...]
 
 set -u
 set -o pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+scheme=FilenFileProviderTests
+default_destination='platform=iOS Simulator,name=iPhone 17 Pro'
+if [ "${1:-}" = "--macos" ]; then
+	shift
+	scheme=FilenFileProviderTestsMac
+	default_destination="platform=macOS,arch=$(uname -m)"
+fi
 
 required=(EMAIL MASTER_KEYS API_KEY PRIVATE_KEY AUTH_VERSION BASE_FOLDER_UUID)
 
@@ -103,7 +111,7 @@ if [ ${#missing[@]} -gt 0 ]; then
 	exit 1
 fi
 
-destination=${FILEN_TEST_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro}
+destination=${FILEN_TEST_DESTINATION:-$default_destination}
 
 TEST_RUNNER_EMAIL="$EMAIL" \
 	TEST_RUNNER_MASTER_KEYS="$MASTER_KEYS" \
@@ -113,7 +121,7 @@ TEST_RUNNER_EMAIL="$EMAIL" \
 	TEST_RUNNER_BASE_FOLDER_UUID="$BASE_FOLDER_UUID" \
 	xcodebuild \
 	-project "$script_dir/FilenFileProvider.xcodeproj" \
-	-scheme FilenFileProviderTests \
+	-scheme "$scheme" \
 	-destination "$destination" \
 	-configuration Debug \
 	CODE_SIGNING_ALLOWED=NO \

@@ -67,6 +67,12 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var itemIdentifier: NSFileProviderItemIdentifier { return identifier }
 
 	var parentItemIdentifier: NSFileProviderItemIdentifier {
+		#if os(macOS)
+			// macOS has no `isTrashed`: an item is trashed exactly when its parent is the trash, so
+			// a trashed item reporting its original parent would show up in that directory.
+			if self.inTrash { return .trashContainer }
+		#endif
+
 		if let explicitParentIdentifier { return explicitParentIdentifier }
 
 		// No explicit parent: derive it from the object, which carries its own container (its
@@ -88,7 +94,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 	var capabilities: NSFileProviderItemCapabilities {
 		switch self.object {
 		case .file(_):
-			if self.isTrashed {
+			if self.inTrash {
 				// allowsTrashing also specifies that it can be restored
 				[.allowsTrashing, .allowsDeleting]
 			} else {
@@ -98,7 +104,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 				]
 			}
 		case .dir(_):
-			if self.isTrashed {
+			if self.inTrash {
 				// allowsTrashing also specifies that it can be restored
 				[.allowsTrashing, .allowsDeleting]
 			} else {
@@ -178,7 +184,7 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		}
 	}
 
-	var isTrashed: Bool {
+	private var inTrash: Bool {
 		// File identifiers are stable ids with no `trash/` prefix, so trash
 		// state comes from the object itself (a trashed item's parent renders
 		// as the "trash" sentinel). The prefix check stays for identifiers
@@ -186,6 +192,10 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		if self.identifier.rawValue.starts(with: TRASH_CACHE_ID + "/") { return true }
 		return objectIsTrashed(self.object)
 	}
+
+	#if os(iOS)
+		var isTrashed: Bool { self.inTrash }
+	#endif
 
 	private static func date(_ millis: Int64) -> Date {
 		Date(timeIntervalSince1970: TimeInterval(millis) / 1000)
@@ -223,17 +233,19 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 		}
 	}
 
-	var favoriteRank: NSNumber? {
-		switch self.object {
-		case .file(let ffiFile):
-			if ffiFile.favoriteRank == 0 { return nil }
-			return NSNumber(value: ffiFile.favoriteRank)
-		case .dir(let ffiDir):
-			if ffiDir.favoriteRank == 0 { return nil }
-			return NSNumber(value: ffiDir.favoriteRank)
-		case .root(_): return nil
+	#if os(iOS)
+		var favoriteRank: NSNumber? {
+			switch self.object {
+			case .file(let ffiFile):
+				if ffiFile.favoriteRank == 0 { return nil }
+				return NSNumber(value: ffiFile.favoriteRank)
+			case .dir(let ffiDir):
+				if ffiDir.favoriteRank == 0 { return nil }
+				return NSNumber(value: ffiDir.favoriteRank)
+			case .root(_): return nil
+			}
 		}
-	}
+	#endif
 
 	/// The provider's own per-item scratch space, where the fields the drive has no column for
 	/// live.

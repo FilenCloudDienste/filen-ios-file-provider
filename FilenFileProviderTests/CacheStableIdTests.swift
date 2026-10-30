@@ -1,3 +1,4 @@
+import FileProvider
 import XCTest
 
 /// Integration tests for the `stable/` id namespace, driven through the Swift UniFFI bindings

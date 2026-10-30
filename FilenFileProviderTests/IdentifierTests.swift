@@ -34,23 +34,43 @@ final class IdentifierTests: XCTestCase {
 
 	// MARK: - A1: trashed items must report their original container, not the drive root
 
-	/// Reproduces what `trashItem` hands back to the system: an item built with no explicit parent.
-	/// Its parent must resolve to the container it was trashed out of. Reporting `.rootContainer`
-	/// would move every trashed item to the drive root in the Files app.
-	func testATrashedItemReportsItsOriginalParentNotTheRoot() {
-		let trashed = makeFile(parent: "trash", originalParent: Self.parentUuid)
-		let item = FileProviderItem(
-			itemIdentifier: NSFileProviderItemIdentifier("stable/" + Self.fileStableUuid),
-			object: .file(trashed))
+	#if os(iOS)
+		/// Reproduces what `trashItem` hands back to the system: an item built with no explicit parent.
+		/// Its parent must resolve to the container it was trashed out of. Reporting `.rootContainer`
+		/// would move every trashed item to the drive root in the Files app.
+		func testATrashedItemReportsItsOriginalParentNotTheRoot() {
+			let trashed = makeFile(parent: "trash", originalParent: Self.parentUuid)
+			let item = FileProviderItem(
+				itemIdentifier: NSFileProviderItemIdentifier("stable/" + Self.fileStableUuid),
+				object: .file(trashed))
 
-		XCTAssertNotEqual(
-			item.parentItemIdentifier, .rootContainer,
-			"a trashed item nested under a folder must not report the drive root as its parent")
-		XCTAssertEqual(
-			item.parentItemIdentifier,
-			NSFileProviderItemIdentifier("stable/" + Self.parentUuid),
-			"a trashed item must report the container it will be restored into")
-	}
+			XCTAssertNotEqual(
+				item.parentItemIdentifier, .rootContainer,
+				"a trashed item nested under a folder must not report the drive root as its parent")
+			XCTAssertEqual(
+				item.parentItemIdentifier,
+				NSFileProviderItemIdentifier("stable/" + Self.parentUuid),
+				"a trashed item must report the container it will be restored into")
+		}
+	#else
+		/// macOS has no `isTrashed`: the trash parent is the only thing that says an item is
+		/// trashed, so it wins over the original parent and over an explicit one.
+		func testATrashedItemReportsTheTrashOnMacOS() {
+			let trashed = makeFile(parent: "trash", originalParent: Self.parentUuid)
+			let identifier = NSFileProviderItemIdentifier("stable/" + Self.fileStableUuid)
+
+			XCTAssertEqual(
+				FileProviderItem(itemIdentifier: identifier, object: .file(trashed))
+					.parentItemIdentifier,
+				.trashContainer)
+			XCTAssertEqual(
+				FileProviderItem(
+					itemIdentifier: identifier, object: .file(trashed),
+					parentItemIdentifier: NSFileProviderItemIdentifier("stable/" + Self.parentUuid)
+				).parentItemIdentifier,
+				.trashContainer)
+		}
+	#endif
 
 	/// An explicitly supplied parent always wins — this is the path every other mutation handler
 	/// already takes, and it must keep working.
@@ -77,14 +97,26 @@ final class IdentifierTests: XCTestCase {
 			NSFileProviderItemIdentifier("stable/" + Self.parentUuid))
 	}
 
-	/// `isTrashed` is read off the object, because a stable identifier carries no `trash/` prefix.
+	/// Trash state is read off the object, because a stable identifier carries no `trash/` prefix.
 	func testTrashStateComesFromTheObjectNotTheIdentifier() {
 		let trashed = makeFile(parent: "trash", originalParent: Self.parentUuid)
 		let live = makeFile(parent: Self.parentUuid, originalParent: nil)
 		let identifier = NSFileProviderItemIdentifier("stable/" + Self.fileStableUuid)
 
-		XCTAssertTrue(FileProviderItem(itemIdentifier: identifier, object: .file(trashed)).isTrashed)
-		XCTAssertFalse(FileProviderItem(itemIdentifier: identifier, object: .file(live)).isTrashed)
+		#if os(iOS)
+			XCTAssertTrue(
+				FileProviderItem(itemIdentifier: identifier, object: .file(trashed)).isTrashed)
+			XCTAssertFalse(FileProviderItem(itemIdentifier: identifier, object: .file(live)).isTrashed)
+		#else
+			XCTAssertEqual(
+				FileProviderItem(itemIdentifier: identifier, object: .file(trashed))
+					.parentItemIdentifier,
+				.trashContainer)
+			XCTAssertEqual(
+				FileProviderItem(itemIdentifier: identifier, object: .file(live))
+					.parentItemIdentifier,
+				NSFileProviderItemIdentifier("stable/" + Self.parentUuid))
+		#endif
 	}
 
 	// MARK: - A5: pin the legacy path-splitting helper

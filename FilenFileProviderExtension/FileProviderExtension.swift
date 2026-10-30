@@ -7,13 +7,23 @@ import os
 
 let PROVIDER = "app.filen.io"
 
-// auth.json DEK keychain item — these MUST match the app side (fileProvider.ts via expo-secure-store).
-// The team-prefixed access group is what lets the app and this extension share the item; the app group
-// alone does not grant keychain sharing on iOS. NOTE: expo-secure-store appends ":no-auth" to the
-// service for items stored without requireAuthentication, so the keychain queries below use
-// "\(AUTH_DEK_SERVICE):no-auth" to match the item the app actually wrote.
-let AUTH_DEK_ACCESS_GROUP = "7YTW5D2K7P.io.filen.sharedkeys"
-let AUTH_DEK_SERVICE = "io.filen.fileprovider"
+#if os(macOS)
+	// The desktop app's team app group. It holds the content cache only: the session arrives over
+	// XPC and stays in this extension's own container and keychain (see AuthService.swift).
+	let APP_GROUP = "7YTW5D2K7P.io.filen.desktop"
+	// auth.json DEK keychain item. Nothing else reads it, so it lives in the extension's own (login)
+	// keychain with no access group, scoped by a service name of its own.
+	let AUTH_DEK_SERVICE = "io.filen.desktop.fileprovider"
+#else
+	let APP_GROUP = "group.io.filen.app"
+	// auth.json DEK keychain item — these MUST match the app side (fileProvider.ts via expo-secure-store).
+	// The team-prefixed access group is what lets the app and this extension share the item; the app group
+	// alone does not grant keychain sharing on iOS. NOTE: expo-secure-store appends ":no-auth" to the
+	// service for items stored without requireAuthentication, so the keychain queries below use
+	// "\(AUTH_DEK_SERVICE):no-auth" to match the item the app actually wrote.
+	let AUTH_DEK_ACCESS_GROUP = "7YTW5D2K7P.io.filen.sharedkeys"
+	let AUTH_DEK_SERVICE = "io.filen.fileprovider"
+#endif
 let AUTH_DEK_ACCOUNT = "fileProviderAuthKey"
 
 /// Runs the first block handed to it and drops every later one.
@@ -420,6 +430,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	static let uploadAttempts = 3
 	public static var uploadingSet = TransfersInFlight(initialState: [:])
 	public static var downloadingSet = TransfersInFlight(initialState: [:])
+	#if os(macOS)
+		/// Vended through `supportedServiceSources`, see AuthService.swift.
+		let authService: AuthServiceSource
+	#endif
 
 	// MARK: - Identity
 
@@ -462,8 +476,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	}
 
 	/// The identifier of the container an object lives in (the original parent
-	/// while trashed — the system ignores the parent of a trashed item and reads
-	/// `isTrashed` instead). Containers are directories, whose stable id IS their
+	/// while trashed — on iOS the system ignores the parent of a trashed item and
+	/// reads `isTrashed` instead; on macOS `FileProviderItem` reports the trash
+	/// itself). Containers are directories, whose stable id IS their
 	/// uuid, so no cache lookup is needed. Falls back to path-splitting the
 	/// item's own identifier, which preserves the legacy behavior for path ids.
 	///
@@ -490,6 +505,25 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
 	// MARK: - Lifecycle
 
+	/// The attributes naming the DEK item: always service AND account, so a query can never match
+	/// another app's item.
+	private static func authDekItem() -> [String: Any] {
+		#if os(macOS)
+			return [
+				kSecClass as String: kSecClassGenericPassword,
+				kSecAttrService as String: AUTH_DEK_SERVICE,
+				kSecAttrAccount as String: Data(AUTH_DEK_ACCOUNT.utf8),
+			]
+		#else
+			return [
+				kSecClass as String: kSecClassGenericPassword,
+				kSecAttrService as String: "\(AUTH_DEK_SERVICE):no-auth",
+				kSecAttrAccount as String: Data(AUTH_DEK_ACCOUNT.utf8),
+				kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
+			]
+		#endif
+	}
+
 	// Reads the 32-byte auth.json DEK from the shared Keychain access group. The app stores it
 	// base64-encoded via expo-secure-store; decode it back to raw bytes for the Rust cache. On any
 	// failure (not provisioned yet, or the item is unavailable before first unlock) return empty
@@ -500,14 +534,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 	// attributes by exact type, so we query with the same Data or SecItemCopyMatching won't find the
 	// item the app wrote.
 	private static func readAuthDek() -> Data? {
-		let query: [String: Any] = [
-			kSecClass as String: kSecClassGenericPassword,
-			kSecAttrService as String: "\(AUTH_DEK_SERVICE):no-auth",
-			kSecAttrAccount as String: Data(AUTH_DEK_ACCOUNT.utf8),
-			kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
-			kSecReturnData as String: true,
-			kSecMatchLimit as String: kSecMatchLimitOne,
-		]
+		var query = Self.authDekItem()
+		query[kSecReturnData as String] = true
+		query[kSecMatchLimit as String] = kSecMatchLimitOne
 		var item: CFTypeRef?
 		let status = SecItemCopyMatching(query as CFDictionary, &item)
 		guard status == errSecSuccess,
@@ -545,16 +574,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			return Data()
 		}
 
-		let accountData = Data(AUTH_DEK_ACCOUNT.utf8)
-		let addQuery: [String: Any] = [
-			kSecClass as String: kSecClassGenericPassword,
-			kSecAttrService as String: "\(AUTH_DEK_SERVICE):no-auth",
-			kSecAttrGeneric as String: accountData,
-			kSecAttrAccount as String: accountData,
-			kSecAttrAccessGroup as String: AUTH_DEK_ACCESS_GROUP,
-			kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-			kSecValueData as String: Data(dek.base64EncodedString().utf8),
-		]
+		var addQuery = Self.authDekItem()
+		addQuery[kSecValueData as String] = Data(dek.base64EncodedString().utf8)
+		#if os(iOS)
+			addQuery[kSecAttrGeneric as String] = Data(AUTH_DEK_ACCOUNT.utf8)
+			addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+		#endif
 		let status = SecItemAdd(addQuery as CFDictionary, nil)
 
 		if status == errSecSuccess {
@@ -570,6 +595,18 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		return Data()
 	}
 
+	/// Where the sealed session lives. On iOS the app writes it into the shared app group; on macOS
+	/// it arrives over XPC and stays in the extension's own container, never in the group.
+	static func authFileURL() -> URL? {
+		#if os(macOS)
+			return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+				.first?.appending(component: "auth.json")
+		#else
+			return FileManager.default.containerURL(
+				forSecurityApplicationGroupIdentifier: APP_GROUP)?.appending(component: "auth.json")
+		#endif
+	}
+
 	required init(domain: NSFileProviderDomain) {
 		let manager = NSFileProviderManager(for: domain)
 		let domainKey = domain.identifier.rawValue
@@ -577,11 +614,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		self.manager = manager
 		self.domainKey = domainKey
 		self.instanceId = Self.claimInstanceId(domainKey: domainKey)
-		let authFile =
-			FileManager.default.containerURL(
-				forSecurityApplicationGroupIdentifier: "group.io.filen.app")?.appending(
-					component: "auth.json"
-				).path(percentEncoded: false) ?? ""
+		let authFileURL = Self.authFileURL()
+		let authFile = authFileURL?.path(percentEncoded: false) ?? ""
 		// The SQLite files (native_cache.db, db_state.json, SDK search DB) live in the
 		// EXTENSION'S private container, not in documentStorage, which sits inside the shared
 		// app-group container. This is NOT what stops the RUNNINGBOARD 0xdead10cc kills, though
@@ -628,7 +662,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 		// system serves from: a replicated extension hands content to the system by staging a
 		// copy (see `stagedContents`).
 		let groupContainer = FileManager.default.containerURL(
-			forSecurityApplicationGroupIdentifier: "group.io.filen.app")
+			forSecurityApplicationGroupIdentifier: APP_GROUP)
 		if groupContainer == nil {
 			Self.logger.error("app group container unavailable; content cache falls back to tmp")
 		}
@@ -654,6 +688,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 					dek: dek)
 			}
 		}
+
+		#if os(macOS)
+			self.authService = AuthServiceSource(
+				state: self.state, manager: manager, authFile: authFileURL, dek: dek)
+		#endif
 
 		super.init()
 
@@ -1125,9 +1164,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 			}
 		}
 		if changedFields.contains(.filename) { steps.append(.rename(item.filename)) }
-		if changedFields.contains(.favoriteRank) {
-			steps.append(.favoriteRank((item.favoriteRank ?? nil)?.int64Value ?? 0))
-		}
+		#if os(iOS)
+			if changedFields.contains(.favoriteRank) {
+				steps.append(.favoriteRank((item.favoriteRank ?? nil)?.int64Value ?? 0))
+			}
+		#endif
 		if changedFields.contains(.tagData) {
 			let tagData = item.tagData ?? nil
 			steps.append(

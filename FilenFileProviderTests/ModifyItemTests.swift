@@ -102,14 +102,23 @@ final class ModifyItemTests: XCTestCase {
 			[.restore(to: "stable/" + Self.folderUuid)])
 	}
 
-	func testAFavouriteDispatchesToTheRank() {
-		XCTAssertEqual(steps(.favoriteRank, item: template(favoriteRank: 5)), [.favoriteRank(5)])
-	}
+	#if os(iOS)
+		func testAFavouriteDispatchesToTheRank() {
+			XCTAssertEqual(
+				steps(.favoriteRank, item: template(favoriteRank: 5)), [.favoriteRank(5)])
+		}
 
-	/// Unfavouriting arrives as a nil rank, which the drive spells zero.
-	func testUnfavouritingDispatchesToRankZero() {
-		XCTAssertEqual(steps(.favoriteRank), [.favoriteRank(0)])
-	}
+		/// Unfavouriting arrives as a nil rank, which the drive spells zero.
+		func testUnfavouritingDispatchesToRankZero() {
+			XCTAssertEqual(steps(.favoriteRank), [.favoriteRank(0)])
+		}
+	#else
+		/// macOS items have no favourite rank, so the field is reported back as unsupported.
+		func testAFavouriteIsNotCarriedOnMacOS() {
+			XCTAssertEqual(steps(.favoriteRank, item: template(favoriteRank: 5)), [])
+			XCTAssertEqual(stillPending(.favoriteRank), .favoriteRank)
+		}
+	#endif
 
 	func testTagsAreStoredAsProviderLocalData() {
 		let tags = Data([0xDE, 0xAD])
@@ -146,9 +155,12 @@ final class ModifyItemTests: XCTestCase {
 	/// A field that dispatched to a step was applied, so it must NOT come back as pending —
 	/// reporting the whole set is how the system is told the provider supports none of it.
 	func testEveryDispatchedFieldIsReportedAsApplied() {
-		let everything: NSFileProviderItemFields = [
-			.contents, .filename, .parentItemIdentifier, .favoriteRank, .tagData, .lastUsedDate,
+		var everything: NSFileProviderItemFields = [
+			.contents, .filename, .parentItemIdentifier, .tagData, .lastUsedDate,
 		]
+		#if os(iOS)
+			everything.insert(.favoriteRank)
+		#endif
 		XCTAssertEqual(stillPending(everything, hasContents: true), [])
 	}
 
@@ -197,14 +209,17 @@ final class ModifyItemTests: XCTestCase {
 	/// Content first (it is what the user is waiting on), then the reparent, then the rename — so
 	/// a rename that collides collides in the container the item ends up in.
 	func testEverythingAtOnceRunsContentThenReparentThenRename() {
+		var expected: [FileProviderExtension.ModifyStep] = [
+			.contents, .move(to: "stable/" + Self.folderUuid), .rename("after.pdf"),
+		]
+		#if os(iOS)
+			expected.append(.favoriteRank(3))
+		#endif
 		XCTAssertEqual(
 			steps(
 				[.contents, .filename, .parentItemIdentifier, .favoriteRank],
 				item: template(name: "after.pdf", favoriteRank: 3), hasContents: true),
-			[
-				.contents, .move(to: "stable/" + Self.folderUuid), .rename("after.pdf"),
-				.favoriteRank(3),
-			])
+			expected)
 	}
 
 	func testNoChangedFieldsDispatchesToNothing() {

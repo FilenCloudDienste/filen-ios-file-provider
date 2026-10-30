@@ -15,6 +15,12 @@
 		FE5700A82E5B000000000001 /* libfilen_mobile_native_cache.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */; };
 		FE5700A92E5B000000000001 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A99E516A2E41FC5500CE63E7 /* libc++.tbd */; };
 		FE5700AA2E5B000000000001 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */; };
+		FE58000B2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = FE58000A2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework */; };
+		FE58000C2E5B000000000001 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A99E516A2E41FC5500CE63E7 /* libc++.tbd */; };
+		FE58000D2E5B000000000001 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */; };
+		FE58001B2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = FE58000A2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework */; };
+		FE58001C2E5B000000000001 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A99E516A2E41FC5500CE63E7 /* libc++.tbd */; };
+		FE58001D2E5B000000000001 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -50,6 +56,9 @@
 		A99E516A2E41FC5500CE63E7 /* libc++.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libc++.tbd"; path = "usr/lib/libc++.tbd"; sourceTree = SDKROOT; };
 		A9D3CAD22E292500009868D0 /* secrets.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = secrets.xcconfig; sourceTree = "<group>"; };
 		FE5700A72E5B000000000001 /* FilenFileProviderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FilenFileProviderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FE5800082E5B000000000001 /* FilenFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FilenFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		FE58000A2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libfilen_mobile_native_cache-macos.xcframework; path = Frameworks/libfilen_mobile_native_cache-macos.xcframework; sourceTree = "<group>"; };
+		FE5800172E5B000000000001 /* FilenFileProviderTestsMac.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FilenFileProviderTestsMac.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -75,6 +84,21 @@
 			);
 			target = FE5700A12E5B000000000001 /* FilenFileProviderTests */;
 		};
+		FE5800092E5B000000000001 /* Exceptions for "FilenFileProviderExtension" folder in "FilenFileProviderMac" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = FE5800012E5B000000000001 /* FilenFileProviderMac */;
+		};
+		FE5800182E5B000000000001 /* Exceptions for "FilenFileProviderExtension" folder in "FilenFileProviderTestsMac" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+				filen_mobile_native_cache.swift,
+			);
+			target = FE5800112E5B000000000001 /* FilenFileProviderTestsMac */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -96,8 +120,15 @@
 			exceptions = (
 				A9D3CAC52E2917D4009868D0 /* Exceptions for "FilenFileProviderExtension" folder in "FilenFileProviderExtension" target */,
 				FE5700AB2E5B000000000001 /* Exceptions for "FilenFileProviderExtension" folder in "FilenFileProviderTests" target */,
+				FE5800092E5B000000000001 /* Exceptions for "FilenFileProviderExtension" folder in "FilenFileProviderMac" target */,
+				FE5800182E5B000000000001 /* Exceptions for "FilenFileProviderExtension" folder in "FilenFileProviderTestsMac" target */,
 			);
 			path = FilenFileProviderExtension;
+			sourceTree = "<group>";
+		};
+		FE5800202E5B000000000001 /* FilenFileProviderMac */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = FilenFileProviderMac;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -130,6 +161,26 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		FE5800062E5B000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FE58000C2E5B000000000001 /* libc++.tbd in Frameworks */,
+				FE58000B2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework in Frameworks */,
+				FE58000D2E5B000000000001 /* SystemConfiguration.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FE5800162E5B000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FE58001C2E5B000000000001 /* libc++.tbd in Frameworks */,
+				FE58001B2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework in Frameworks */,
+				FE58001D2E5B000000000001 /* SystemConfiguration.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -140,6 +191,7 @@
 				6F42416F2E0955F600F3F4BD /* FilenFileProvider */,
 				6F42417D2E0955F700F3F4BD /* FilenFileProviderTests */,
 				6F42419F2E09567900F3F4BD /* FilenFileProviderExtension */,
+				FE5800202E5B000000000001 /* FilenFileProviderMac */,
 				6F42419C2E09567900F3F4BD /* Frameworks */,
 				6F42416E2E0955F600F3F4BD /* Products */,
 			);
@@ -151,6 +203,8 @@
 				6F42416D2E0955F600F3F4BD /* FilenFileProvider.app */,
 				6F42419B2E09567900F3F4BD /* FilenFileProviderExtension.appex */,
 				FE5700A72E5B000000000001 /* FilenFileProviderTests.xctest */,
+				FE5800082E5B000000000001 /* FilenFileProvider.appex */,
+				FE5800172E5B000000000001 /* FilenFileProviderTestsMac.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -161,6 +215,7 @@
 				A99E516A2E41FC5500CE63E7 /* libc++.tbd */,
 				A94A39862E33C2D000CE63E7 /* SystemConfiguration.framework */,
 				A92387692E2904A3000EF2BF /* libfilen_mobile_native_cache.xcframework */,
+				FE58000A2E5B000000000001 /* libfilen_mobile_native_cache-macos.xcframework */,
 				6F42419D2E09567900F3F4BD /* UniformTypeIdentifiers.framework */,
 			);
 			name = Frameworks;
@@ -237,6 +292,50 @@
 			productReference = FE5700A72E5B000000000001 /* FilenFileProviderTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		FE5800012E5B000000000001 /* FilenFileProviderMac */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FE5800022E5B000000000001 /* Build configuration list for PBXNativeTarget "FilenFileProviderMac" */;
+			buildPhases = (
+				FE5800052E5B000000000001 /* Sources */,
+				FE5800062E5B000000000001 /* Frameworks */,
+				FE5800072E5B000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				6F42419F2E09567900F3F4BD /* FilenFileProviderExtension */,
+			);
+			name = FilenFileProviderMac;
+			packageProductDependencies = (
+			);
+			productName = FilenFileProviderMac;
+			productReference = FE5800082E5B000000000001 /* FilenFileProvider.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		FE5800112E5B000000000001 /* FilenFileProviderTestsMac */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FE5800122E5B000000000001 /* Build configuration list for PBXNativeTarget "FilenFileProviderTestsMac" */;
+			buildPhases = (
+				FE5800152E5B000000000001 /* Sources */,
+				FE5800162E5B000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				6F42417D2E0955F700F3F4BD /* FilenFileProviderTests */,
+				6F42419F2E09567900F3F4BD /* FilenFileProviderExtension */,
+			);
+			name = FilenFileProviderTestsMac;
+			packageProductDependencies = (
+			);
+			productName = FilenFileProviderTestsMac;
+			productReference = FE5800172E5B000000000001 /* FilenFileProviderTestsMac.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -255,6 +354,12 @@
 					};
 					FE5700A12E5B000000000001 = {
 						CreatedOnToolsVersion = 16.3;
+					};
+					FE5800012E5B000000000001 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					FE5800112E5B000000000001 = {
+						CreatedOnToolsVersion = 26.5;
 					};
 				};
 			};
@@ -275,6 +380,8 @@
 				6F42416C2E0955F600F3F4BD /* FilenFileProvider */,
 				6F42419A2E09567900F3F4BD /* FilenFileProviderExtension */,
 				FE5700A12E5B000000000001 /* FilenFileProviderTests */,
+				FE5800012E5B000000000001 /* FilenFileProviderMac */,
+				FE5800112E5B000000000001 /* FilenFileProviderTestsMac */,
 			);
 		};
 /* End PBXProject section */
@@ -289,6 +396,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		6F4241992E09567900F3F4BD /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FE5800072E5B000000000001 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -313,6 +427,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		FE5700A52E5B000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FE5800052E5B000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FE5800152E5B000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -619,6 +747,118 @@
 			};
 			name = Release;
 		};
+		FE5800032E5B000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "arm64 x86_64";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_ENTITLEMENTS = FilenFileProviderMac/FilenFileProviderMac.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = FilenFileProviderMac/Info.plist;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.filen.desktop.FileProvider;
+				PRODUCT_NAME = FilenFileProvider;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		FE5800042E5B000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "arm64 x86_64";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_ENTITLEMENTS = FilenFileProviderMac/FilenFileProviderMac.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEPLOYMENT_POSTPROCESSING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = FilenFileProviderMac/Info.plist;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.filen.desktop.FileProvider;
+				PRODUCT_NAME = FilenFileProvider;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRIP_INSTALLED_PRODUCT = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		FE5800132E5B000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.filen.desktop.FilenFileProviderTestsMac;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		FE5800142E5B000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.filen.desktop.FilenFileProviderTestsMac;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -654,6 +894,24 @@
 			buildConfigurations = (
 				FE5700A32E5B000000000001 /* Debug */,
 				FE5700A42E5B000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FE5800022E5B000000000001 /* Build configuration list for PBXNativeTarget "FilenFileProviderMac" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FE5800032E5B000000000001 /* Debug */,
+				FE5800042E5B000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FE5800122E5B000000000001 /* Build configuration list for PBXNativeTarget "FilenFileProviderTestsMac" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FE5800132E5B000000000001 /* Debug */,
+				FE5800142E5B000000000001 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

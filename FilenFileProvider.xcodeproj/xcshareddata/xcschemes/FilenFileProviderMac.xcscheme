@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Scheme
+   LastUpgradeVersion = "1630"
+   wasCreatedForAppExtension = "YES"
+   version = "2.0">
+   <BuildAction
+      parallelizeBuildables = "YES"
+      buildImplicitDependencies = "YES"
+      buildArchitectures = "Automatic">
+      <PreActions>
+         <ExecutionAction
+            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+            <ActionContent
+               title = "Run Script"
+               scriptText = "# Builds the universal macOS Rust xcframework and regenerates the UniFFI bindings.&#10;export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)&#10;export CC=$(xcrun --find clang)&#10;export CXX=$(xcrun --find clang++)&#10;unset XROS_DEPLOYMENT_TARGET&#10;unset MACOSX_DEPLOYMENT_TARGET&#10;unset TVOS_DEPLOYMENT_TARGET&#10;unset WATCHOS_DEPLOYMENT_TARGET&#10;unset DRIVERKIT_DEPLOYMENT_TARGET&#10;unset SWIFT_DEBUG_INFORMATION_FORMAT&#10;unset SWIFT_DEBUG_INFORMATION_VERSION&#10;&#10;[ -f ~/.bash_profile ] &amp;&amp; . ~/.bash_profile&#10;cd $SRCROOT&#10;/bin/sh ./build-rust.sh --macos --rust-dir ../filen-rs --rust-crate-name filen-mobile-native-cache&#10;">
+               <EnvironmentBuildable>
+                  <BuildableReference
+                     BuildableIdentifier = "primary"
+                     BlueprintIdentifier = "FE5800012E5B000000000001"
+                     BuildableName = "FilenFileProvider.appex"
+                     BlueprintName = "FilenFileProviderMac"
+                     ReferencedContainer = "container:FilenFileProvider.xcodeproj">
+                  </BuildableReference>
+               </EnvironmentBuildable>
+            </ActionContent>
+         </ExecutionAction>
+      </PreActions>
+      <BuildActionEntries>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "FE5800012E5B000000000001"
+               BuildableName = "FilenFileProvider.appex"
+               BlueprintName = "FilenFileProviderMac"
+               ReferencedContainer = "container:FilenFileProvider.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction
+      buildConfiguration = "Debug"
+      selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
+      selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
+      shouldUseLaunchSchemeArgsEnv = "YES"
+      shouldAutocreateTestPlan = "YES">
+   </TestAction>
+   <LaunchAction
+      buildConfiguration = "Release"
+      selectedDebuggerIdentifier = ""
+      selectedLauncherIdentifier = "Xcode.IDEFoundation.Launcher.PosixSpawn"
+      launchStyle = "0"
+      askForAppToLaunch = "Yes"
+      useCustomWorkingDirectory = "NO"
+      ignoresPersistentStateOnLaunch = "NO"
+      debugDocumentVersioning = "YES"
+      debugServiceExtension = "internal"
+      allowLocationSimulation = "YES"
+      launchAutomaticallySubstyle = "2">
+   </LaunchAction>
+   <ProfileAction
+      buildConfiguration = "Release"
+      shouldUseLaunchSchemeArgsEnv = "YES"
+      savedToolIdentifier = ""
+      useCustomWorkingDirectory = "NO"
+      debugDocumentVersioning = "YES"
+      askForAppToLaunch = "Yes"
+      launchAutomaticallySubstyle = "2">
+   </ProfileAction>
+   <AnalyzeAction
+      buildConfiguration = "Debug">
+   </AnalyzeAction>
+   <ArchiveAction
+      buildConfiguration = "Release"
+      revealArchiveInOrganizer = "YES">
+   </ArchiveAction>
+</Scheme>

@@ -51,6 +51,23 @@ file.
 Without a session the tests skip rather than fail, so an unconfigured checkout stays green. Each
 test creates a directory under the account's drive root and trashes it on teardown.
 
+## macOS
+
+`FilenFileProviderMac` builds the same sources as a macOS 14+ extension for the desktop app
+(`io.filen.desktop.FileProvider`, universal arm64 + x86_64). It is built unsigned; the desktop
+packaging signs it with `FilenFileProviderMac/FilenFileProviderMac.entitlements` and the hardened
+runtime. The session reaches it over the `io.filen.FileProviderAuth` XPC service
+(`AuthService.swift`), never through the app group.
+
+```sh
+./build-rust.sh --macos --rust-dir ../filen-rs --rust-crate-name filen-mobile-native-cache
+xcodebuild -project FilenFileProvider.xcodeproj -target FilenFileProviderMac -configuration Release
+./run-tests.sh --macos                           # FilenFileProviderTestsMac, run natively
+```
+
+The macOS library goes in its own xcframework, but the generated Swift bindings are shared with
+iOS, so build both from the same filen-rs revision.
+
 
 ## License
 

@@ -139,7 +139,7 @@ enum TestAuth {
 
 	/// Builds the auth JSON through `JSONSerialization` rather than string interpolation, so a value
 	/// containing a quote or backslash can't corrupt the document.
-	private static func sessionJson(_ credentials: Credentials) throws -> String {
+	static func sessionJson(_ credentials: Credentials) throws -> String {
 		let masterKeys = try parseMasterKeys(credentials.masterKeysJson)
 
 		let sdkConfig: [String: Any] = [
